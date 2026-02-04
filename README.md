@@ -16,7 +16,7 @@ Should *you* use it? That depends. Do you:
 - Read the manual before assembling furniture? **Maybe wait for 1.0**
 - Shoot first? **Welcome aboard**
 
-There are [known issues](https://github.com/ezmode-games/smuggler/issues). We're fixing them. Eventually. The Kessel Run wasn't built in a day.
+There are [known issues](https://github.com/ezmode-games/smuggler/issues). We're shaving parsecs, not days.
 
 ## What It Does
 
