@@ -42,7 +42,8 @@ pub fn batch_rows(
 
         // Check if adding this row would exceed limits
         let would_exceed_count = current_batch.len() >= batch_config.batch_size;
-        let would_exceed_size = current_bytes + row_bytes + base_overhead > batch_config.max_statement_bytes
+        let would_exceed_size = current_bytes + row_bytes + base_overhead
+            > batch_config.max_statement_bytes
             && !current_batch.is_empty();
 
         if would_exceed_count || would_exceed_size {
@@ -182,9 +183,7 @@ mod tests {
     #[test]
     fn batch_by_size() {
         // Create rows with large strings to trigger size limit
-        let rows: Vec<_> = (0..5)
-            .map(|i| make_row(i, &"x".repeat(1000)))
-            .collect();
+        let rows: Vec<_> = (0..5).map(|i| make_row(i, &"x".repeat(1000))).collect();
         let columns = vec!["id".to_string(), "name".to_string()];
         let config = BatchConfig {
             batch_size: 100,
@@ -224,10 +223,7 @@ mod tests {
 
     #[test]
     fn generate_multi_row_insert() {
-        let rows = vec![
-            make_row(1, "alice"),
-            make_row(2, "bob"),
-        ];
+        let rows = vec![make_row(1, "alice"), make_row(2, "bob")];
         let columns = vec!["id".to_string(), "name".to_string()];
 
         let (sql, params) = generate_batch_insert("users", &columns, &rows);
@@ -284,7 +280,10 @@ mod tests {
         let row_size = estimate_row_size(
             &{
                 let mut row = HashMap::new();
-                row.insert("text".to_string(), JsonValue::String("hello\"world".to_string()));
+                row.insert(
+                    "text".to_string(),
+                    JsonValue::String("hello\"world".to_string()),
+                );
                 row
             },
             &["text".to_string()],

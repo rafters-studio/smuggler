@@ -73,10 +73,7 @@ struct D1Error {
 /// - Network errors
 ///
 /// Respects Retry-After header when present.
-async fn with_retry<F, Fut, T>(
-    retry_config: &RetryConfig,
-    operation: F,
-) -> Result<T>
+async fn with_retry<F, Fut, T>(retry_config: &RetryConfig, operation: F) -> Result<T>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T>>,
@@ -589,7 +586,8 @@ impl D1Client {
         rows: &[HashMap<String, JsonValue>],
     ) -> Result<usize> {
         use crate::config::BatchConfig;
-        self.upsert_rows_batched(table, rows, &BatchConfig::default()).await
+        self.upsert_rows_batched(table, rows, &BatchConfig::default())
+            .await
     }
 
     /// Insert or replace rows with custom batch configuration.
@@ -740,7 +738,11 @@ mod tests {
 
     #[test]
     fn test_parse_http_error_500() {
-        let err = parse_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "server error", None);
+        let err = parse_http_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "server error",
+            None,
+        );
         match err {
             SyncError::ServerError { status, message } => {
                 assert_eq!(status, 500);
@@ -796,7 +798,10 @@ mod tests {
     #[test]
     fn test_extract_retry_after_header_invalid() {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::RETRY_AFTER, "not-a-number".parse().unwrap());
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "not-a-number".parse().unwrap(),
+        );
         assert_eq!(extract_retry_after_header(&headers), None);
     }
 
@@ -832,7 +837,11 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "Should succeed after retries");
-        assert_eq!(call_count.load(Ordering::SeqCst), 3, "Should have called operation 3 times");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "Should have called operation 3 times"
+        );
     }
 
     #[tokio::test]
@@ -861,7 +870,11 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "Should fail immediately on 400");
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "Should only call operation once");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "Should only call operation once"
+        );
 
         match result.unwrap_err() {
             SyncError::BadRequest { status, .. } => assert_eq!(status, 400),
@@ -893,7 +906,11 @@ mod tests {
 
         assert!(result.is_err(), "Should fail after exhausting retries");
         // Initial attempt + max_retries = 1 + 2 = 3 calls
-        assert_eq!(call_count.load(Ordering::SeqCst), 3, "Should call operation max_retries + 1 times");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "Should call operation max_retries + 1 times"
+        );
 
         match result.unwrap_err() {
             SyncError::RetryExhausted { attempts, .. } => {
@@ -902,5 +919,4 @@ mod tests {
             _ => panic!("Expected RetryExhausted error"),
         }
     }
-
 }

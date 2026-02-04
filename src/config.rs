@@ -225,7 +225,9 @@ impl Config {
 
     /// Get the local database path (guaranteed to be Some after load)
     pub fn local_db_path(&self) -> &str {
-        self.local_db.as_deref().expect("local_db should be set after load")
+        self.local_db
+            .as_deref()
+            .expect("local_db should be set after load")
     }
 
     /// Check if a table should be synced
@@ -280,7 +282,10 @@ fn detect_local_db() -> Result<String> {
             debug!("Found sqlite: {} ({} bytes)", path.display(), size);
 
             // Prefer larger files (more data = more likely the active one)
-            if best_file.as_ref().map_or(true, |(_, best_size)| size > *best_size) {
+            if best_file
+                .as_ref()
+                .map_or(true, |(_, best_size)| size > *best_size)
+            {
                 best_file = Some((path, size));
             }
         }
@@ -392,10 +397,10 @@ mod tests {
             backoff_multiplier: 2.0,
         };
 
-        assert_eq!(config.delay_for_attempt(0), 1000);  // 1000 * 2^0 = 1000
-        assert_eq!(config.delay_for_attempt(1), 2000);  // 1000 * 2^1 = 2000
-        assert_eq!(config.delay_for_attempt(2), 4000);  // 1000 * 2^2 = 4000
-        assert_eq!(config.delay_for_attempt(3), 8000);  // 1000 * 2^3 = 8000
+        assert_eq!(config.delay_for_attempt(0), 1000); // 1000 * 2^0 = 1000
+        assert_eq!(config.delay_for_attempt(1), 2000); // 1000 * 2^1 = 2000
+        assert_eq!(config.delay_for_attempt(2), 4000); // 1000 * 2^2 = 4000
+        assert_eq!(config.delay_for_attempt(3), 8000); // 1000 * 2^3 = 8000
         assert_eq!(config.delay_for_attempt(4), 16000); // 1000 * 2^4 = 16000
     }
 
