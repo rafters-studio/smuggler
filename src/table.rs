@@ -214,4 +214,13 @@ mod tests {
         let s: &str = validated.as_ref();
         assert_eq!(s, "users");
     }
+
+    #[test]
+    fn table_names_are_case_sensitive() {
+        let schema = test_schema();
+        // SQLite table names are case-sensitive by default
+        assert!(schema.validate("USERS").is_err());
+        assert!(schema.validate("Users").is_err());
+        assert!(schema.validate("users").is_ok());
+    }
 }
