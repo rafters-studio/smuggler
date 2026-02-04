@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="smuggler.webp" alt="Smuggler" width="400">
+</p>
+
 # Smuggler
 
 > "Look, I ain't in this for your revolution, and I'm not in it for you, Princess. I expect to be well paid. I'm in it for the money." - Han Solo
