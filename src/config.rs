@@ -51,6 +51,23 @@ pub struct SyncConfig {
     /// Backoff multiplier for exponential backoff (default: 2.0)
     #[serde(default = "default_backoff_multiplier")]
     pub backoff_multiplier: f64,
+
+    /// Maximum number of rows per batch for upsert operations
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+
+    /// Maximum bytes per SQL statement (D1 has limits)
+    #[serde(default = "default_max_statement_bytes")]
+    pub max_statement_bytes: usize,
+}
+
+fn default_batch_size() -> usize {
+    100
+}
+
+fn default_max_statement_bytes() -> usize {
+    // D1 has a 100KB limit per statement, use 90KB to be safe
+    90 * 1024
 }
 
 impl Default for SyncConfig {
@@ -64,6 +81,37 @@ impl Default for SyncConfig {
             initial_retry_delay_ms: default_initial_retry_delay_ms(),
             max_retry_delay_ms: default_max_retry_delay_ms(),
             backoff_multiplier: default_backoff_multiplier(),
+            batch_size: default_batch_size(),
+            max_statement_bytes: default_max_statement_bytes(),
+        }
+    }
+}
+
+/// Configuration for batch operations
+#[derive(Debug, Clone, Copy)]
+pub struct BatchConfig {
+    /// Maximum number of rows per batch
+    pub batch_size: usize,
+    /// Maximum bytes per SQL statement
+    pub max_statement_bytes: usize,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: default_batch_size(),
+            max_statement_bytes: default_max_statement_bytes(),
+        }
+    }
+}
+
+impl BatchConfig {
+    /// Create BatchConfig from SyncConfig
+    #[allow(dead_code)]
+    pub fn from_sync_config(sync: &SyncConfig) -> Self {
+        Self {
+            batch_size: sync.batch_size,
+            max_statement_bytes: sync.max_statement_bytes,
         }
     }
 }
@@ -177,7 +225,9 @@ impl Config {
 
     /// Get the local database path (guaranteed to be Some after load)
     pub fn local_db_path(&self) -> &str {
-        self.local_db.as_deref().expect("local_db should be set after load")
+        self.local_db
+            .as_deref()
+            .expect("local_db should be set after load")
     }
 
     /// Check if a table should be synced
@@ -232,7 +282,10 @@ fn detect_local_db() -> Result<String> {
             debug!("Found sqlite: {} ({} bytes)", path.display(), size);
 
             // Prefer larger files (more data = more likely the active one)
-            if best_file.as_ref().map_or(true, |(_, best_size)| size > *best_size) {
+            if best_file
+                .as_ref()
+                .map_or(true, |(_, best_size)| size > *best_size)
+            {
                 best_file = Some((path, size));
             }
         }
@@ -344,10 +397,10 @@ mod tests {
             backoff_multiplier: 2.0,
         };
 
-        assert_eq!(config.delay_for_attempt(0), 1000);  // 1000 * 2^0 = 1000
-        assert_eq!(config.delay_for_attempt(1), 2000);  // 1000 * 2^1 = 2000
-        assert_eq!(config.delay_for_attempt(2), 4000);  // 1000 * 2^2 = 4000
-        assert_eq!(config.delay_for_attempt(3), 8000);  // 1000 * 2^3 = 8000
+        assert_eq!(config.delay_for_attempt(0), 1000); // 1000 * 2^0 = 1000
+        assert_eq!(config.delay_for_attempt(1), 2000); // 1000 * 2^1 = 2000
+        assert_eq!(config.delay_for_attempt(2), 4000); // 1000 * 2^2 = 4000
+        assert_eq!(config.delay_for_attempt(3), 8000); // 1000 * 2^3 = 8000
         assert_eq!(config.delay_for_attempt(4), 16000); // 1000 * 2^4 = 16000
     }
 

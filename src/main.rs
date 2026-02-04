@@ -22,7 +22,9 @@
 //! - [`error`] - Error types
 //! - [`table`] - Table name validation
 //! - [`timestamp`] - Timestamp parsing and comparison
+//! - [`batch`] - Batch operations for multi-row upserts
 
+mod batch;
 mod config;
 mod diff;
 mod error;
