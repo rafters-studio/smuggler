@@ -51,6 +51,25 @@ pub struct SyncConfig {
     /// Backoff multiplier for exponential backoff (default: 2.0)
     #[serde(default = "default_backoff_multiplier")]
     pub backoff_multiplier: f64,
+
+    /// Maximum number of rows per batch for upsert operations
+    #[serde(default = "default_batch_size")]
+    #[allow(dead_code)]
+    pub batch_size: usize,
+
+    /// Maximum bytes per SQL statement (D1 has limits)
+    #[serde(default = "default_max_statement_bytes")]
+    #[allow(dead_code)]
+    pub max_statement_bytes: usize,
+}
+
+fn default_batch_size() -> usize {
+    100
+}
+
+fn default_max_statement_bytes() -> usize {
+    // D1 has a 100KB limit per statement, use 90KB to be safe
+    90 * 1024
 }
 
 impl Default for SyncConfig {
@@ -64,6 +83,37 @@ impl Default for SyncConfig {
             initial_retry_delay_ms: default_initial_retry_delay_ms(),
             max_retry_delay_ms: default_max_retry_delay_ms(),
             backoff_multiplier: default_backoff_multiplier(),
+            batch_size: default_batch_size(),
+            max_statement_bytes: default_max_statement_bytes(),
+        }
+    }
+}
+
+/// Configuration for batch operations
+#[derive(Debug, Clone, Copy)]
+pub struct BatchConfig {
+    /// Maximum number of rows per batch
+    pub batch_size: usize,
+    /// Maximum bytes per SQL statement
+    pub max_statement_bytes: usize,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: default_batch_size(),
+            max_statement_bytes: default_max_statement_bytes(),
+        }
+    }
+}
+
+impl BatchConfig {
+    /// Create BatchConfig from SyncConfig
+    #[allow(dead_code)]
+    pub fn from_sync_config(sync: &SyncConfig) -> Self {
+        Self {
+            batch_size: sync.batch_size,
+            max_statement_bytes: sync.max_statement_bytes,
         }
     }
 }

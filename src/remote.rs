@@ -580,44 +580,71 @@ impl D1Client {
         Ok(all_results)
     }
 
-    /// Insert or replace rows
+    /// Insert or replace rows using multi-row INSERT statements.
+    ///
+    /// Uses the default batch configuration (100 rows, 90KB max).
     pub async fn upsert_rows(
         &self,
         table: &str,
         rows: &[HashMap<String, JsonValue>],
     ) -> Result<usize> {
+        use crate::config::BatchConfig;
+        self.upsert_rows_batched(table, rows, &BatchConfig::default()).await
+    }
+
+    /// Insert or replace rows with custom batch configuration.
+    ///
+    /// Groups rows into batches respecting both count and size limits,
+    /// then executes multi-row INSERT statements for better performance.
+    pub async fn upsert_rows_batched(
+        &self,
+        table: &str,
+        rows: &[HashMap<String, JsonValue>],
+        batch_config: &crate::config::BatchConfig,
+    ) -> Result<usize> {
+        use crate::batch::{batch_rows, generate_batch_insert};
+
         if rows.is_empty() {
             return Ok(0);
         }
 
         let columns = self.table_columns(table).await?;
-        let col_list = columns
-            .iter()
-            .map(|c| format!("\"{}\"", c))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let batches = batch_rows(rows, &columns, batch_config);
 
         let mut total_changes = 0;
 
-        // D1 has limits, so we process one row at a time
-        // (batch operations are limited in D1)
-        for row in rows {
-            let placeholders = columns.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            let sql = format!(
-                "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-                table, col_list, placeholders
-            );
+        debug!(
+            "Upserting {} rows in {} batches to table {}",
+            rows.len(),
+            batches.len(),
+            table
+        );
 
-            let params: Vec<JsonValue> = columns
-                .iter()
-                .map(|col| row.get(col).cloned().unwrap_or(JsonValue::Null))
-                .collect();
+        for (i, batch) in batches.iter().enumerate() {
+            let (sql, params) = generate_batch_insert(table, &columns, &batch.rows);
+
+            if sql.is_empty() {
+                continue;
+            }
+
+            debug!(
+                "Batch {}/{}: {} rows, ~{} bytes",
+                i + 1,
+                batches.len(),
+                batch.rows.len(),
+                batch.estimated_bytes
+            );
 
             let changes = self.execute(&sql, params).await?;
             total_changes += changes as usize;
         }
 
-        info!("Upserted {} rows into D1 table {}", total_changes, table);
+        info!(
+            "Upserted {} rows into D1 table {} ({} batches)",
+            total_changes,
+            table,
+            batches.len()
+        );
         Ok(total_changes)
     }
 
