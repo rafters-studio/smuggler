@@ -101,13 +101,22 @@ impl Timestamp {
 
     /// Parse ISO 8601 format
     fn parse_iso8601(s: &str) -> Result<Self, ParseTimestampError> {
-        // Remove trailing Z or timezone
+        // Remove trailing Z or timezone offset
         let s = s.trim_end_matches('Z');
+
+        // Find T separator position to distinguish date hyphens from timezone
+        let t_pos = s.find('T');
+
         let s = if let Some(idx) = s.rfind('+') {
-            &s[..idx]
+            // Positive timezone offset - strip if after T
+            if t_pos.map_or(false, |t| idx > t) {
+                &s[..idx]
+            } else {
+                s
+            }
         } else if let Some(idx) = s.rfind('-') {
-            // Check if this minus is part of timezone (after T) or date
-            if s.matches('-').count() > 2 {
+            // Negative timezone offset - strip if after T (not a date hyphen)
+            if t_pos.map_or(false, |t| idx > t) {
                 &s[..idx]
             } else {
                 s
@@ -203,10 +212,22 @@ impl Timestamp {
             });
         }
 
-        if hour > 23 || minute > 59 || second > 59 {
+        if hour > 23 {
             return Err(ParseTimestampError {
                 input: s.to_string(),
-                message: "time component out of range".to_string(),
+                message: format!("hour {} out of range (0-23)", hour),
+            });
+        }
+        if minute > 59 {
+            return Err(ParseTimestampError {
+                input: s.to_string(),
+                message: format!("minute {} out of range (0-59)", minute),
+            });
+        }
+        if second > 59 {
+            return Err(ParseTimestampError {
+                input: s.to_string(),
+                message: format!("second {} out of range (0-59)", second),
             });
         }
 
@@ -408,5 +429,41 @@ mod tests {
         let err = Timestamp::parse("invalid").unwrap_err();
         assert_eq!(err.input(), "invalid");
         assert!(!err.message().is_empty());
+    }
+
+    #[test]
+    fn parse_iso8601_positive_timezone() {
+        // Timezone is stripped - time is treated as-is
+        let ts = Timestamp::parse("2024-01-01T05:00:00+05:00").unwrap();
+        // Should be treated as 05:00:00 (timezone stripped, not converted)
+        assert_eq!(ts.as_unix(), 1704067200 + 5 * 3600);
+    }
+
+    #[test]
+    fn parse_iso8601_negative_timezone() {
+        // Timezone is stripped - time is treated as-is
+        let ts = Timestamp::parse("2024-01-01T00:00:00-05:00").unwrap();
+        // Should be treated as 00:00:00 (timezone stripped, not converted)
+        assert_eq!(ts.as_unix(), 1704067200);
+    }
+
+    #[test]
+    fn parse_iso8601_zero_offset() {
+        let ts = Timestamp::parse("2024-01-01T00:00:00+00:00").unwrap();
+        assert_eq!(ts.as_unix(), 1704067200);
+    }
+
+    #[test]
+    fn reject_invalid_hour() {
+        let result = Timestamp::parse("2024-01-01T25:00:00Z");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("hour"));
+    }
+
+    #[test]
+    fn reject_invalid_minute() {
+        let result = Timestamp::parse("2024-01-01T00:60:00Z");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("minute"));
     }
 }
