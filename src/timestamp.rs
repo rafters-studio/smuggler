@@ -107,23 +107,12 @@ impl Timestamp {
         // Find T separator position to distinguish date hyphens from timezone
         let t_pos = s.find('T');
 
-        let s = if let Some(idx) = s.rfind('+') {
-            // Positive timezone offset - strip if after T
-            if t_pos.map_or(false, |t| idx > t) {
-                &s[..idx]
-            } else {
-                s
-            }
-        } else if let Some(idx) = s.rfind('-') {
-            // Negative timezone offset - strip if after T (not a date hyphen)
-            if t_pos.map_or(false, |t| idx > t) {
-                &s[..idx]
-            } else {
-                s
-            }
-        } else {
-            s
-        };
+        // Strip timezone offset (+XX:XX or -XX:XX) if it appears after the T separator
+        let s = ['+', '-']
+            .iter()
+            .filter_map(|&sign| s.rfind(sign))
+            .find(|&idx| t_pos.is_some_and(|t| idx > t))
+            .map_or(s, |idx| &s[..idx]);
 
         Self::parse_datetime_parts(s, 'T')
     }
@@ -135,108 +124,66 @@ impl Timestamp {
 
     /// Parse datetime with configurable separator between date and time
     fn parse_datetime_parts(s: &str, sep: char) -> Result<Self, ParseTimestampError> {
+        let err = |msg: &str| ParseTimestampError {
+            input: s.to_string(),
+            message: msg.to_string(),
+        };
+
         let parts: Vec<&str> = s.split(sep).collect();
         if parts.len() != 2 {
-            return Err(ParseTimestampError {
-                input: s.to_string(),
-                message: format!("expected date{}time format", sep),
-            });
+            return Err(err(&format!("expected date{}time format", sep)));
         }
 
         let date_parts: Vec<&str> = parts[0].split('-').collect();
         if date_parts.len() != 3 {
-            return Err(ParseTimestampError {
-                input: s.to_string(),
-                message: "invalid date format, expected YYYY-MM-DD".to_string(),
-            });
+            return Err(err("invalid date format, expected YYYY-MM-DD"));
         }
 
         let time_parts: Vec<&str> = parts[1].split(':').collect();
         if time_parts.len() < 2 {
-            return Err(ParseTimestampError {
-                input: s.to_string(),
-                message: "invalid time format, expected HH:MM:SS".to_string(),
-            });
+            return Err(err("invalid time format, expected HH:MM:SS"));
         }
 
-        let year: i32 = date_parts[0].parse().map_err(|_| ParseTimestampError {
-            input: s.to_string(),
-            message: "invalid year".to_string(),
-        })?;
-        let month: u32 = date_parts[1].parse().map_err(|_| ParseTimestampError {
-            input: s.to_string(),
-            message: "invalid month".to_string(),
-        })?;
-        let day: u32 = date_parts[2].parse().map_err(|_| ParseTimestampError {
-            input: s.to_string(),
-            message: "invalid day".to_string(),
-        })?;
+        let year: i32 = date_parts[0].parse().map_err(|_| err("invalid year"))?;
+        let month: u32 = date_parts[1].parse().map_err(|_| err("invalid month"))?;
+        let day: u32 = date_parts[2].parse().map_err(|_| err("invalid day"))?;
 
-        let hour: u32 = time_parts[0].parse().map_err(|_| ParseTimestampError {
-            input: s.to_string(),
-            message: "invalid hour".to_string(),
-        })?;
-        let minute: u32 = time_parts[1].parse().map_err(|_| ParseTimestampError {
-            input: s.to_string(),
-            message: "invalid minute".to_string(),
-        })?;
-        // Handle fractional seconds by taking only the integer part
-        let second: u32 = time_parts.get(2)
+        let hour: u32 = time_parts[0].parse().map_err(|_| err("invalid hour"))?;
+        let minute: u32 = time_parts[1].parse().map_err(|_| err("invalid minute"))?;
+        let second: u32 = time_parts
+            .get(2)
             .map(|s| s.split('.').next().unwrap_or("0"))
             .unwrap_or("0")
             .parse()
-            .map_err(|_| ParseTimestampError {
-                input: s.to_string(),
-                message: "invalid second".to_string(),
-            })?;
+            .map_err(|_| err("invalid second"))?;
 
         // Validate ranges
         if !(1..=12).contains(&month) {
-            return Err(ParseTimestampError {
-                input: s.to_string(),
-                message: "month out of range (1-12)".to_string(),
-            });
+            return Err(err("month out of range (1-12)"));
         }
 
-        // Validate day for the specific month (accounting for leap years)
         let days_in_month = match month {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
             4 | 6 | 9 | 11 => 30,
             2 => if is_leap_year(year) { 29 } else { 28 },
-            _ => unreachable!(), // month already validated above
+            _ => unreachable!(),
         };
         if !(1..=days_in_month).contains(&day) {
-            return Err(ParseTimestampError {
-                input: s.to_string(),
-                message: format!("day out of range (1-{}) for month {}", days_in_month, month),
-            });
+            return Err(err(&format!("day out of range (1-{}) for month {}", days_in_month, month)));
         }
 
         if hour > 23 {
-            return Err(ParseTimestampError {
-                input: s.to_string(),
-                message: format!("hour {} out of range (0-23)", hour),
-            });
+            return Err(err(&format!("hour {} out of range (0-23)", hour)));
         }
         if minute > 59 {
-            return Err(ParseTimestampError {
-                input: s.to_string(),
-                message: format!("minute {} out of range (0-59)", minute),
-            });
+            return Err(err(&format!("minute {} out of range (0-59)", minute)));
         }
         if second > 59 {
-            return Err(ParseTimestampError {
-                input: s.to_string(),
-                message: format!("second {} out of range (0-59)", second),
-            });
+            return Err(err(&format!("second {} out of range (0-59)", second)));
         }
 
-        // Convert to Unix timestamp (simplified, assumes UTC)
-        // Use checked arithmetic to prevent overflow on extreme dates
-        let overflow_err = || ParseTimestampError {
-            input: s.to_string(),
-            message: "timestamp value out of range".to_string(),
-        };
+        // Convert to Unix timestamp (assumes UTC)
+        let overflow_err = || err("timestamp value out of range");
 
         // Days since epoch for each year
         let mut days: i64 = 0;
@@ -250,9 +197,9 @@ impl Timestamp {
         }
 
         // Days for completed months in current year
-        let month_days = [31i64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        for m in 0..(month - 1) as usize {
-            days = days.checked_add(month_days[m]).ok_or_else(overflow_err)?;
+        const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        for (m, &month_day_count) in MONTH_DAYS.iter().enumerate().take((month - 1) as usize) {
+            days = days.checked_add(month_day_count).ok_or_else(overflow_err)?;
             if m == 1 && is_leap_year(year) {
                 days = days.checked_add(1).ok_or_else(overflow_err)?;
             }
