@@ -82,7 +82,7 @@ jobs:
         run: |
           cd artifacts
           find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -print0 | \
-            xargs -0 sha256sum | sed 's|  \./[^/]*/||' > ../checksums.txt
+            xargs -0 sha256sum | sed 's|  \./[^/]*/|  |' > ../checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

@@ -57,19 +57,21 @@ trap cleanup EXIT INT TERM
 
 # Detect HTTP client: prefer curl, fall back to wget.
 FETCH=""
-fetch() {
-  local url="$1"
-  local output="$2"
-  if [ -n "${FETCH}" ]; then
-    :
-  elif command -v curl >/dev/null 2>&1; then
+detect_http_client() {
+  if [ -n "${FETCH}" ]; then return; fi
+  if command -v curl >/dev/null 2>&1; then
     FETCH="curl"
   elif command -v wget >/dev/null 2>&1; then
     FETCH="wget"
   else
     error "Neither curl nor wget found. Please install one and retry."
   fi
+}
 
+fetch() {
+  local url="$1"
+  local output="$2"
+  detect_http_client
   if [ "${FETCH}" = "curl" ]; then
     curl -fsSL -o "${output}" "${url}"
   else
@@ -80,12 +82,11 @@ fetch() {
 # Follow a redirect to get the final URL (used for version resolution).
 fetch_redirect_url() {
   local url="$1"
-  if command -v curl >/dev/null 2>&1; then
+  detect_http_client
+  if [ "${FETCH}" = "curl" ]; then
     curl -fsSL -o /dev/null -w '%{url_effective}' "${url}"
-  elif command -v wget >/dev/null 2>&1; then
-    wget --spider -S -O /dev/null "${url}" 2>&1 | grep -i 'Location:' | tail -1 | awk '{print $2}' | tr -d '\r'
   else
-    error "Neither curl nor wget found. Please install one and retry."
+    wget --spider -S -O /dev/null "${url}" 2>&1 | grep -i 'Location:' | tail -1 | awk '{print $2}' | tr -d '\r'
   fi
 }
 
@@ -158,6 +159,7 @@ resolve_version() {
 verify_checksum() {
   local archive="$1"
   local checksums_file="$2"
+  local platform="$3"
   local archive_name
   archive_name="$(basename "${archive}")"
 
@@ -165,7 +167,7 @@ verify_checksum() {
 
   # Extract the expected line from checksums.txt.
   local expected_line
-  expected_line="$(grep "${archive_name}" "${checksums_file}" || true)"
+  expected_line="$(grep -F "${archive_name}" "${checksums_file}" || true)"
   if [ -z "${expected_line}" ]; then
     error "No checksum found for ${archive_name} in checksums.txt."
   fi
@@ -175,8 +177,6 @@ verify_checksum() {
   echo "${expected_line}" > "${check_file}"
 
   # Use the platform-appropriate checksum tool.
-  local platform
-  platform="$(detect_platform)"
   local checksum_ok=true
   if [ "${platform}" = "macos" ]; then
     (cd "${TMPDIR_INSTALL}" && shasum -a 256 -c "${check_file}" >/dev/null 2>&1) || checksum_ok=false
@@ -202,18 +202,8 @@ ensure_path() {
   local config_file=""
 
   case "${shell_name}" in
-    bash)
-      config_file="${HOME}/.bashrc"
-      # Intentionally literal; expands at shell startup.
-      # shellcheck disable=SC2016
-      path_line='export PATH="${HOME}/.local/bin:${PATH}"'
-      ;;
-    zsh)
-      config_file="${HOME}/.zshrc"
-      # Intentionally literal; expands at shell startup.
-      # shellcheck disable=SC2016
-      path_line='export PATH="${HOME}/.local/bin:${PATH}"'
-      ;;
+    bash) config_file="${HOME}/.bashrc" ;;
+    zsh)  config_file="${HOME}/.zshrc" ;;
     fish)
       config_file="${HOME}/.config/fish/config.fish"
       path_line='fish_add_path ~/.local/bin'
@@ -223,6 +213,10 @@ ensure_path() {
       return
       ;;
   esac
+
+  # Default for bash/zsh (intentionally literal; expands at shell startup).
+  # shellcheck disable=SC2016
+  [ -z "${path_line}" ] && path_line='export PATH="${HOME}/.local/bin:${PATH}"'
 
   # Only append if the line is not already present.
   if [ -f "${config_file}" ] && grep -qF "${path_line}" "${config_file}" 2>/dev/null; then
@@ -270,7 +264,7 @@ main() {
   fetch "${base_url}/checksums.txt" "${checksums_path}"
 
   # Verify integrity.
-  verify_checksum "${archive_path}" "${checksums_path}"
+  verify_checksum "${archive_path}" "${checksums_path}" "${platform}"
 
   # Extract and install.
   info "Installing to ${INSTALL_DIR}..."
