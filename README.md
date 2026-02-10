@@ -29,25 +29,29 @@ D1 is SQLite at the edge, but Cloudflare doesn't give you a way to sync your loc
 
 ## Installation
 
-### Pre-built binaries
+### Quick install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ezmode-games/smuggler/main/install.sh | bash
+```
+
+Detects your platform, downloads the right binary, verifies the checksum, and installs to `~/.local/bin/`. Supports Linux x64, macOS x64, and macOS ARM64.
+
+Install a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ezmode-games/smuggler/main/install.sh | bash -s v0.1.0
+```
+
+### Manual download
 
 | Platform | Download |
 |----------|----------|
 | Linux x64 | [smuggler-linux-x64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-linux-x64.tar.gz) |
 | macOS x64 | [smuggler-macos-x64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-macos-x64.tar.gz) |
 | macOS ARM64 | [smuggler-macos-arm64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-macos-arm64.tar.gz) |
-| Windows x64 | [smuggler-windows-x64.zip](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-windows-x64.zip) |
 
 ### From source
-
-```bash
-git clone https://github.com/ezmode-games/smuggler
-cd smuggler
-cargo build --release
-# Binary at ./target/release/smuggler
-```
-
-Or if you're feeling lucky:
 
 ```bash
 cargo install --git https://github.com/ezmode-games/smuggler

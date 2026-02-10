@@ -40,6 +40,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
 
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck install.sh
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}
