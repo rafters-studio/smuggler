@@ -64,6 +64,7 @@ pub enum SyncError {
     #[error("Retry exhausted after {attempts} attempts: {last_error}")]
     RetryExhausted { attempts: u32, last_error: String },
 
+    #[allow(dead_code)]
     #[error("Invalid table name '{name}'. Available tables: [{available}]")]
     InvalidTableName { name: String, available: String },
 

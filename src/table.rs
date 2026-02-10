@@ -2,6 +2,10 @@
 //!
 //! This module provides the [`ValidatedTableName`] newtype which ensures
 //! table names are validated against an allowlist before use in SQL queries.
+//!
+//! Note: This module is not yet integrated into the sync pipeline.
+//! It will be used in a future PR to enforce validated table names.
+#![allow(dead_code)]
 
 use crate::error::{Result, SyncError};
 use std::collections::HashSet;

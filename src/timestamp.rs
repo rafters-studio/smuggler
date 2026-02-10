@@ -1,6 +1,10 @@
 //! Timestamp parsing and comparison for sync operations
 //!
 //! Handles multiple timestamp formats:
+//!
+//! Note: This module is not yet integrated into the sync pipeline.
+//! It will be used in a future PR to unify timestamp comparison.
+#![allow(dead_code)]
 //! - Unix timestamps (seconds since epoch): "1704067200"
 //! - ISO 8601: "2024-01-01T00:00:00Z"
 //! - SQLite datetime: "2024-01-01 00:00:00"
@@ -35,7 +39,11 @@ impl ParseTimestampError {
 
 impl fmt::Display for ParseTimestampError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "failed to parse timestamp '{}': {}", self.input, self.message)
+        write!(
+            f,
+            "failed to parse timestamp '{}': {}",
+            self.input, self.message
+        )
     }
 }
 
@@ -73,14 +81,13 @@ impl Timestamp {
         }
 
         // Try Unix timestamp first (all digits, possibly with leading minus)
-        if s.chars().all(|c| c.is_ascii_digit()) ||
-           (s.starts_with('-') && s[1..].chars().all(|c| c.is_ascii_digit())) {
-            return s.parse::<i64>()
-                .map(Self)
-                .map_err(|_| ParseTimestampError {
-                    input: s.to_string(),
-                    message: "invalid Unix timestamp".to_string(),
-                });
+        if s.chars().all(|c| c.is_ascii_digit())
+            || (s.starts_with('-') && s[1..].chars().all(|c| c.is_ascii_digit()))
+        {
+            return s.parse::<i64>().map(Self).map_err(|_| ParseTimestampError {
+                input: s.to_string(),
+                message: "invalid Unix timestamp".to_string(),
+            });
         }
 
         // Try ISO 8601 format: 2024-01-01T00:00:00Z or with timezone
@@ -165,11 +172,20 @@ impl Timestamp {
         let days_in_month = match month {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
             4 | 6 | 9 | 11 => 30,
-            2 => if is_leap_year(year) { 29 } else { 28 },
+            2 => {
+                if is_leap_year(year) {
+                    29
+                } else {
+                    28
+                }
+            }
             _ => unreachable!(),
         };
         if !(1..=days_in_month).contains(&day) {
-            return Err(err(&format!("day out of range (1-{}) for month {}", days_in_month, month)));
+            return Err(err(&format!(
+                "day out of range (1-{}) for month {}",
+                days_in_month, month
+            )));
         }
 
         if hour > 23 {
@@ -206,7 +222,9 @@ impl Timestamp {
         }
 
         // Add days in current month (minus 1 since day 1 = 0 days elapsed)
-        days = days.checked_add((day - 1) as i64).ok_or_else(overflow_err)?;
+        days = days
+            .checked_add((day - 1) as i64)
+            .ok_or_else(overflow_err)?;
 
         // Convert to seconds with overflow checking
         let day_secs = days.checked_mul(86400).ok_or_else(overflow_err)?;
@@ -325,8 +343,14 @@ mod tests {
         let expected = 1704067200;
 
         assert_eq!(Timestamp::parse("1704067200").unwrap().as_unix(), expected);
-        assert_eq!(Timestamp::parse("2024-01-01T00:00:00Z").unwrap().as_unix(), expected);
-        assert_eq!(Timestamp::parse("2024-01-01 00:00:00").unwrap().as_unix(), expected);
+        assert_eq!(
+            Timestamp::parse("2024-01-01T00:00:00Z").unwrap().as_unix(),
+            expected
+        );
+        assert_eq!(
+            Timestamp::parse("2024-01-01 00:00:00").unwrap().as_unix(),
+            expected
+        );
     }
 
     #[test]

@@ -29,6 +29,17 @@ D1 is SQLite at the edge, but Cloudflare doesn't give you a way to sync your loc
 
 ## Installation
 
+### Pre-built binaries
+
+| Platform | Download |
+|----------|----------|
+| Linux x64 | [smuggler-linux-x64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-linux-x64.tar.gz) |
+| macOS x64 | [smuggler-macos-x64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-macos-x64.tar.gz) |
+| macOS ARM64 | [smuggler-macos-arm64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-macos-arm64.tar.gz) |
+| Windows x64 | [smuggler-windows-x64.zip](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-windows-x64.zip) |
+
+### From source
+
 ```bash
 git clone https://github.com/ezmode-games/smuggler
 cd smuggler
