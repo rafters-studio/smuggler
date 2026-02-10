@@ -30,7 +30,7 @@ else
 fi
 
 info() {
-  printf "${BLUE}info${RESET}: %s\n" "$1"
+  printf "${BLUE}info${RESET}: %s\n" "$1" >&2
 }
 
 warn() {
@@ -43,7 +43,7 @@ error() {
 }
 
 success() {
-  printf "${GREEN}success${RESET}: %s\n" "$1"
+  printf "${GREEN}success${RESET}: %s\n" "$1" >&2
 }
 
 # Temp dir with cleanup trap.
@@ -149,9 +149,10 @@ resolve_version() {
   # The redirect URL ends with the tag, e.g. .../releases/tag/v0.1.0
   local tag
   tag="${redirect_url##*/}"
-  if [ -z "${tag}" ]; then
-    error "Could not parse version tag from redirect URL."
-  fi
+  case "${tag}" in
+    v[0-9]*) ;;
+    *) error "No releases found. Specify a version with: bash -s v0.1.0" ;;
+  esac
   echo "${tag}"
 }
 
@@ -236,7 +237,7 @@ ensure_path() {
 main() {
   local version="${1:-}"
 
-  printf '%b\n\n' "${BOLD}Smuggler Installer${RESET}"
+  printf '%b\n\n' "${BOLD}Smuggler Installer${RESET}" >&2
 
   local platform arch artifact_name
   platform="$(detect_platform)"
