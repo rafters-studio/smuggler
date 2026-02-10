@@ -51,14 +51,12 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../${{ matrix.artifact }}.${{ matrix.ext }} smuggler
-          cd ../../..
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
           7z a ../../../${{ matrix.artifact }}.${{ matrix.ext }} smuggler.exe
-          cd ../../..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -81,11 +79,7 @@ jobs:
           path: artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: |
-            artifacts/smuggler-linux-x64/smuggler-linux-x64.tar.gz
-            artifacts/smuggler-macos-x64/smuggler-macos-x64.tar.gz
-            artifacts/smuggler-macos-arm64/smuggler-macos-arm64.tar.gz
-            artifacts/smuggler-windows-x64/smuggler-windows-x64.zip
+          files: artifacts/**/*

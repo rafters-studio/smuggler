@@ -3,7 +3,6 @@
 use crate::config::RetryConfig;
 use crate::error::{Result, SyncError};
 use crate::local::RowMeta;
-use crate::table::TableSchema;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -166,18 +165,6 @@ fn extract_retry_after(body: &str) -> Option<u64> {
 }
 
 impl D1Client {
-    /// Create a new D1 client with default retry configuration
-    #[allow(dead_code)]
-    pub fn new(account_id: String, database_id: String, api_token: String) -> Self {
-        Self {
-            client: Client::new(),
-            account_id,
-            database_id,
-            api_token,
-            retry_config: RetryConfig::default(),
-        }
-    }
-
     /// Create a new D1 client with custom retry configuration
     pub fn with_retry_config(
         account_id: String,
@@ -378,17 +365,6 @@ impl D1Client {
         Ok(tables)
     }
 
-    /// Get the database schema for table name validation.
-    ///
-    /// Queries sqlite_master to get all user tables from D1.
-    #[allow(dead_code)]
-    pub async fn get_schema(&self) -> Result<TableSchema> {
-        let tables = self.list_tables().await.map_err(|e| {
-            SyncError::SchemaQueryFailed(format!("Failed to query D1 schema: {}", e))
-        })?;
-        Ok(TableSchema::new(tables))
-    }
-
     /// Get table column info
     pub async fn table_columns(&self, table: &str) -> Result<Vec<String>> {
         let results = self
@@ -433,13 +409,6 @@ impl D1Client {
         }
 
         Ok(pk_cols)
-    }
-
-    /// Check if table has a specific column
-    #[allow(dead_code)]
-    pub async fn has_column(&self, table: &str, column: &str) -> Result<bool> {
-        let columns = self.table_columns(table).await?;
-        Ok(columns.iter().any(|c| c == column))
     }
 
     /// Get row metadata for change detection
@@ -647,7 +616,6 @@ impl D1Client {
     }
 
     /// Delete rows by primary key
-    /// Reserved for full sync mode
     #[allow(dead_code)]
     pub async fn delete_rows(&self, table: &str, pk_values: &[String]) -> Result<usize> {
         if pk_values.is_empty() {

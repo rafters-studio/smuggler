@@ -103,7 +103,7 @@ smuggler pull      # D1 -> Local (safer YOLO)
 -c, --config <FILE>   Config file [default: config.toml]
 -v, --verbose         See what's happening under the hood
 --dry-run             Coward mode (just kidding, it's smart)
---table <NAME>        Sync one table only
+--table <NAME>        Sync one table only (validated against schema)
 ```
 
 ## How It Works
@@ -187,8 +187,8 @@ Things we don't do:
 ### "401 Unauthorized"
 Your token is expired or wrong. Make a new one.
 
-### "Table not found"
-Run your migrations on both databases. We don't create tables.
+### "Invalid table name"
+Smuggler validates `--table` input against your database schema before touching any SQL. If the table doesn't exist, you'll get a list of available tables. Run your migrations on both databases first. We don't create tables.
 
 ### All rows show as "content_differs"
 Check that column order and types match. NULL vs empty string will cause hash mismatches.
@@ -199,10 +199,10 @@ Large syncs take time. Check the GitHub issues for performance improvements in p
 ## Development
 
 ```bash
-cargo test        # Run the tests (there should be more)
-cargo fmt         # Format code
-cargo clippy      # Lint
-RUST_LOG=debug cargo run -- diff  # Debug output
+cargo test                       # Run the tests
+cargo fmt                        # Format code
+cargo clippy --all-targets       # Lint (including tests)
+RUST_LOG=debug cargo run -- diff # Debug output
 ```
 
 ## Related Projects

@@ -2,10 +2,6 @@
 //!
 //! This module provides the [`ValidatedTableName`] newtype which ensures
 //! table names are validated against an allowlist before use in SQL queries.
-//!
-//! Note: This module is not yet integrated into the sync pipeline.
-//! It will be used in a future PR to enforce validated table names.
-#![allow(dead_code)]
 
 use crate::error::{Result, SyncError};
 use std::collections::HashSet;
@@ -38,11 +34,13 @@ impl ValidatedTableName {
     }
 
     /// Get the table name as a string slice.
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Consume the validated name and return the inner string.
+    #[allow(dead_code)]
     pub fn into_string(self) -> String {
         self.0
     }
@@ -86,16 +84,19 @@ impl TableSchema {
     }
 
     /// Check if a table name exists in the schema.
+    #[allow(dead_code)]
     pub fn contains(&self, name: &str) -> bool {
         self.tables.contains(name)
     }
 
     /// Get the number of tables in the schema.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.tables.len()
     }
 
     /// Check if the schema is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }

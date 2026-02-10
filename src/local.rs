@@ -89,11 +89,8 @@ impl LocalDb {
     /// Get the database schema for table name validation.
     ///
     /// Queries sqlite_master to get all user tables.
-    #[allow(dead_code)]
     pub fn get_schema(&self) -> Result<TableSchema> {
-        let tables = self.list_tables().map_err(|e| {
-            SyncError::SchemaQueryFailed(format!("Failed to query local schema: {}", e))
-        })?;
+        let tables = self.list_tables()?;
         Ok(TableSchema::new(tables))
     }
 
@@ -345,7 +342,6 @@ impl LocalDb {
     }
 
     /// Delete rows by primary key
-    /// Reserved for full sync mode
     #[allow(dead_code)]
     pub fn delete_rows(&mut self, table: &str, pk_values: &[String]) -> Result<usize> {
         if pk_values.is_empty() {

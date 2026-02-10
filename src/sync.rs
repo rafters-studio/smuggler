@@ -9,32 +9,24 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
 
 /// Result of a sync operation
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SyncResult {
     pub table: String,
     pub rows_pushed: usize,
     pub rows_pulled: usize,
-    #[allow(dead_code)]
-    pub rows_deleted_local: usize,
-    #[allow(dead_code)]
-    pub rows_deleted_remote: usize,
-    #[allow(dead_code)]
-    pub errors: Vec<String>,
 }
 
 impl SyncResult {
     pub fn new(table: &str) -> Self {
         Self {
             table: table.to_string(),
-            ..Default::default()
+            rows_pushed: 0,
+            rows_pulled: 0,
         }
     }
 
     pub fn has_changes(&self) -> bool {
-        self.rows_pushed > 0
-            || self.rows_pulled > 0
-            || self.rows_deleted_local > 0
-            || self.rows_deleted_remote > 0
+        self.rows_pushed > 0 || self.rows_pulled > 0
     }
 }
 
@@ -147,30 +139,6 @@ pub async fn pull_table(
     result.rows_pulled = count;
 
     pb.finish_with_message(format!("Pulled {} rows", result.rows_pulled));
-
-    Ok(result)
-}
-
-/// Bidirectional sync
-/// Reserved for full bidirectional sync mode
-#[allow(dead_code)]
-pub async fn sync_table(
-    local: &mut LocalDb,
-    remote: &D1Client,
-    table: &str,
-    diff: &TableDiff,
-    conflict_resolution: ConflictResolution,
-    dry_run: bool,
-) -> Result<SyncResult> {
-    let mut result = SyncResult::new(table);
-
-    // Push local changes
-    let push_result = push_table(local, remote, table, diff, conflict_resolution, dry_run).await?;
-    result.rows_pushed = push_result.rows_pushed;
-
-    // Pull remote changes
-    let pull_result = pull_table(local, remote, table, diff, conflict_resolution, dry_run).await?;
-    result.rows_pulled = pull_result.rows_pulled;
 
     Ok(result)
 }

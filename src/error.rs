@@ -28,16 +28,6 @@ pub enum SyncError {
     #[error("No primary key found for table: {0}")]
     NoPrimaryKey(String),
 
-    /// Reserved for strict conflict detection mode
-    #[allow(dead_code)]
-    #[error("Sync conflict on table {table}, row {pk}: local={local_ts}, remote={remote_ts}")]
-    Conflict {
-        table: String,
-        pk: String,
-        local_ts: String,
-        remote_ts: String,
-    },
-
     #[error("D1 API error: {message} (code: {code:?})")]
     D1Api { message: String, code: Option<i64> },
 
@@ -64,13 +54,8 @@ pub enum SyncError {
     #[error("Retry exhausted after {attempts} attempts: {last_error}")]
     RetryExhausted { attempts: u32, last_error: String },
 
-    #[allow(dead_code)]
     #[error("Invalid table name '{name}'. Available tables: [{available}]")]
     InvalidTableName { name: String, available: String },
-
-    #[error("Failed to query database schema: {0}")]
-    #[allow(dead_code)]
-    SchemaQueryFailed(String),
 }
 
 impl SyncError {

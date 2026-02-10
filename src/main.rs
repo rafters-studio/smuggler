@@ -21,7 +21,6 @@
 //! - [`sync`] - Push/pull orchestration
 //! - [`error`] - Error types
 //! - [`table`] - Table name validation
-//! - [`timestamp`] - Timestamp parsing and comparison
 //! - [`batch`] - Batch operations for multi-row upserts
 
 mod batch;
@@ -32,7 +31,6 @@ mod local;
 mod remote;
 mod sync;
 mod table;
-mod timestamp;
 
 use crate::config::Config;
 use crate::diff::diff_table;
@@ -155,7 +153,14 @@ async fn run_push(config: &Config, table: Option<String>, dry_run: bool) -> erro
     // Test connection
     remote.test_connection().await?;
 
-    let tables = table.map(|t| vec![t]);
+    let tables = match table {
+        Some(t) => {
+            let schema = local.get_schema()?;
+            let _ = schema.validate(&t)?;
+            Some(vec![t])
+        }
+        None => None,
+    };
     let results = push_all(&local, &remote, config, tables, dry_run).await?;
 
     // Print summary
@@ -191,7 +196,14 @@ async fn run_pull(config: &Config, table: Option<String>, dry_run: bool) -> erro
     // Test connection
     remote.test_connection().await?;
 
-    let tables = table.map(|t| vec![t]);
+    let tables = match table {
+        Some(t) => {
+            let schema = local.get_schema()?;
+            let _ = schema.validate(&t)?;
+            Some(vec![t])
+        }
+        None => None,
+    };
     let results = pull_all(&mut local, &remote, config, tables, dry_run).await?;
 
     // Print summary
@@ -228,7 +240,11 @@ async fn run_diff(config: &Config, table: Option<String>) -> error::Result<()> {
     remote.test_connection().await?;
 
     let tables = match table {
-        Some(t) => vec![t],
+        Some(t) => {
+            let schema = local.get_schema()?;
+            let _ = schema.validate(&t)?;
+            vec![t]
+        }
         None => get_tables_to_sync(&local, &remote, config).await?,
     };
 
