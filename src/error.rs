@@ -56,6 +56,18 @@ pub enum SyncError {
 
     #[error("Invalid table name '{name}'. Available tables: [{available}]")]
     InvalidTableName { name: String, available: String },
+
+    #[error(
+        "D1 bind parameter limit exceeded: query needs {param_count} params \
+         ({row_count} rows x {col_count} columns), but D1 allows at most {limit}. \
+         This is a smuggler bug -- please report it."
+    )]
+    ParamLimitExceeded {
+        param_count: usize,
+        row_count: usize,
+        col_count: usize,
+        limit: usize,
+    },
 }
 
 impl SyncError {

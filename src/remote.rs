@@ -526,8 +526,11 @@ impl D1Client {
             .collect::<Vec<_>>()
             .join(", ");
 
-        // D1 has a limit on query size, so we batch
-        let batch_size = 100;
+        // D1 allows at most 100 bind params per query.
+        // For single-column PKs that's 100 rows; for composite PKs
+        // each row still contributes one param to the IN clause (the
+        // concatenated PK expression is compared server-side), so 100 is safe.
+        let batch_size = crate::batch::D1_MAX_BIND_PARAMS;
         let mut all_results = Vec::new();
 
         for chunk in pk_values.chunks(batch_size) {
@@ -569,22 +572,35 @@ impl D1Client {
         rows: &[HashMap<String, JsonValue>],
         batch_config: &crate::config::BatchConfig,
     ) -> Result<usize> {
-        use crate::batch::{batch_rows, generate_batch_insert};
+        use crate::batch::{batch_rows, generate_batch_insert, D1_MAX_BIND_PARAMS};
 
         if rows.is_empty() {
             return Ok(0);
         }
 
         let columns = self.table_columns(table).await?;
+
+        // Fail fast if a single row already exceeds D1's param limit
+        if columns.len() > D1_MAX_BIND_PARAMS {
+            return Err(SyncError::ParamLimitExceeded {
+                param_count: columns.len(),
+                row_count: 1,
+                col_count: columns.len(),
+                limit: D1_MAX_BIND_PARAMS,
+            });
+        }
+
         let batches = batch_rows(rows, &columns, batch_config);
 
         let mut total_changes = 0;
 
         debug!(
-            "Upserting {} rows in {} batches to table {}",
+            "Upserting {} rows in {} batches to table {} ({} cols, max {} rows/batch by param limit)",
             rows.len(),
             batches.len(),
-            table
+            table,
+            columns.len(),
+            D1_MAX_BIND_PARAMS / columns.len(),
         );
 
         for (i, batch) in batches.iter().enumerate() {
@@ -595,10 +611,11 @@ impl D1Client {
             }
 
             debug!(
-                "Batch {}/{}: {} rows, ~{} bytes",
+                "Batch {}/{}: {} rows, {} params, ~{} bytes",
                 i + 1,
                 batches.len(),
                 batch.rows.len(),
+                params.len(),
                 batch.estimated_bytes
             );
 

@@ -1,12 +1,16 @@
 //! Batch operations for efficient multi-row upserts
 //!
-//! Groups rows into batches respecting both count and size limits,
+//! Groups rows into batches respecting count, size, and D1 bind parameter limits,
 //! then generates multi-row INSERT statements.
 
 use crate::config::BatchConfig;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use tracing::warn;
+
+/// Cloudflare D1 maximum bind parameters per query.
+/// See: https://developers.cloudflare.com/d1/platform/limits/
+pub const D1_MAX_BIND_PARAMS: usize = 100;
 
 /// A batch of rows ready for insertion
 #[derive(Debug)]
@@ -15,18 +19,39 @@ pub struct Batch {
     pub estimated_bytes: usize,
 }
 
-/// Group rows into batches respecting count and size limits.
+/// Group rows into batches respecting count, size, and D1 bind parameter limits.
 ///
-/// Each batch will have at most `batch_config.batch_size` rows and
-/// the generated SQL statement will be at most `batch_config.max_statement_bytes`.
+/// Each batch will have at most `batch_config.batch_size` rows,
+/// the generated SQL statement will be at most `batch_config.max_statement_bytes`,
+/// and the total bind parameters (`rows * columns`) will not exceed [`D1_MAX_BIND_PARAMS`].
 pub fn batch_rows(
     rows: &[HashMap<String, JsonValue>],
     columns: &[String],
     batch_config: &BatchConfig,
 ) -> Vec<Batch> {
-    if rows.is_empty() {
+    if rows.is_empty() || columns.is_empty() {
         return vec![];
     }
+
+    // D1 caps bind params at 100. Each row needs one param per column.
+    let max_rows_by_params = D1_MAX_BIND_PARAMS / columns.len();
+    if max_rows_by_params == 0 {
+        // Table has more columns than D1 allows params -- single-row batches
+        // will still exceed the limit, but we emit them so the caller gets a
+        // clear error from D1 rather than silently dropping data.
+        warn!(
+            "Table has {} columns which exceeds D1's {} bind-parameter limit; \
+             single-row inserts will fail",
+            columns.len(),
+            D1_MAX_BIND_PARAMS,
+        );
+    }
+
+    let effective_max = if max_rows_by_params == 0 {
+        1 // still emit rows so the error surfaces
+    } else {
+        batch_config.batch_size.min(max_rows_by_params)
+    };
 
     let mut batches = Vec::new();
     let mut current_batch = Vec::new();
@@ -41,7 +66,7 @@ pub fn batch_rows(
         let row_bytes = estimate_row_size(row, columns);
 
         // Check if adding this row would exceed limits
-        let would_exceed_count = current_batch.len() >= batch_config.batch_size;
+        let would_exceed_count = current_batch.len() >= effective_max;
         let would_exceed_size = current_bytes + row_bytes + base_overhead
             > batch_config.max_statement_bytes
             && !current_batch.is_empty();
@@ -111,6 +136,9 @@ fn estimate_row_size(row: &HashMap<String, JsonValue>, columns: &[String]) -> us
 /// Generate a multi-row INSERT OR REPLACE statement.
 ///
 /// Returns the SQL string and flattened parameters.
+///
+/// Warns if the generated parameter count would exceed D1's bind limit.
+/// Callers should use [`batch_rows`] first to keep batches within bounds.
 pub fn generate_batch_insert(
     table: &str,
     columns: &[String],
@@ -118,6 +146,19 @@ pub fn generate_batch_insert(
 ) -> (String, Vec<JsonValue>) {
     if rows.is_empty() {
         return (String::new(), vec![]);
+    }
+
+    let param_count = rows.len() * columns.len();
+    if param_count > D1_MAX_BIND_PARAMS {
+        warn!(
+            "Batch for table '{}' has {} bind params ({} rows x {} cols), \
+             exceeding D1 limit of {}. This query will likely fail.",
+            table,
+            param_count,
+            rows.len(),
+            columns.len(),
+            D1_MAX_BIND_PARAMS,
+        );
     }
 
     let col_list = columns
@@ -178,6 +219,67 @@ mod tests {
         assert_eq!(batches[1].rows.len(), 3);
         assert_eq!(batches[2].rows.len(), 3);
         assert_eq!(batches[3].rows.len(), 1);
+    }
+
+    #[test]
+    fn batch_respects_d1_param_limit() {
+        // 10 columns means max 10 rows per batch (100 / 10)
+        let columns: Vec<String> = (0..10).map(|i| format!("col_{}", i)).collect();
+        let rows: Vec<_> = (0..25)
+            .map(|i| {
+                let mut row = HashMap::new();
+                for col in &columns {
+                    row.insert(col.clone(), JsonValue::Number(i.into()));
+                }
+                row
+            })
+            .collect();
+
+        let config = BatchConfig {
+            batch_size: 100, // would allow 100, but param limit caps at 10
+            max_statement_bytes: 100_000,
+        };
+
+        let batches = batch_rows(&rows, &columns, &config);
+
+        // 25 rows / 10 per batch = 3 batches (10 + 10 + 5)
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].rows.len(), 10);
+        assert_eq!(batches[1].rows.len(), 10);
+        assert_eq!(batches[2].rows.len(), 5);
+
+        // Verify no batch exceeds D1 param limit
+        for batch in &batches {
+            assert!(batch.rows.len() * columns.len() <= D1_MAX_BIND_PARAMS);
+        }
+    }
+
+    #[test]
+    fn batch_wide_table_single_row_batches() {
+        // 50 columns means max 2 rows per batch (100 / 50)
+        let columns: Vec<String> = (0..50).map(|i| format!("col_{}", i)).collect();
+        let rows: Vec<_> = (0..5)
+            .map(|i| {
+                let mut row = HashMap::new();
+                for col in &columns {
+                    row.insert(col.clone(), JsonValue::Number(i.into()));
+                }
+                row
+            })
+            .collect();
+
+        let config = BatchConfig {
+            batch_size: 100,
+            max_statement_bytes: 100_000,
+        };
+
+        let batches = batch_rows(&rows, &columns, &config);
+
+        // 5 rows / 2 per batch = 3 batches (2 + 2 + 1)
+        assert_eq!(batches.len(), 3);
+        for batch in &batches {
+            assert!(batch.rows.len() * columns.len() <= D1_MAX_BIND_PARAMS);
+        }
     }
 
     #[test]

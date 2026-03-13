@@ -67,7 +67,7 @@ pub async fn push_table(
         return Ok(result);
     }
 
-    // Upsert to remote
+    // Upsert to remote (batch system handles D1 param limits)
     let pb = ProgressBar::new(rows.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -76,13 +76,9 @@ pub async fn push_table(
     );
     pb.set_message(format!("Pushing {}", table));
 
-    // Push in batches to avoid overwhelming D1
-    let batch_size = 50;
-    for chunk in rows.chunks(batch_size) {
-        let count = remote.upsert_rows(table, chunk).await?;
-        result.rows_pushed += count;
-        pb.inc(chunk.len() as u64);
-    }
+    let count = remote.upsert_rows(table, &rows).await?;
+    result.rows_pushed = count;
+    pb.inc(rows.len() as u64);
 
     pb.finish_with_message(format!("Pushed {} rows", result.rows_pushed));
 
