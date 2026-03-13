@@ -34,8 +34,10 @@ pub fn batch_rows(
     }
 
     // D1 caps bind params at 100. Each row needs one param per column.
-    // Use max(1, ...) so tables wider than 100 columns still emit rows
-    // (the caller gets a clear D1 error rather than silently dropped data).
+    // Use max(1, ...) so tables wider than 100 columns still produce
+    // single-row batches rather than zero batches. The primary caller
+    // (upsert_rows_batched) guards against this case earlier, but
+    // batch_rows remains defensive for direct callers.
     let max_rows_by_params = (D1_MAX_BIND_PARAMS / columns.len()).max(1);
     if columns.len() > D1_MAX_BIND_PARAMS {
         warn!(
@@ -250,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_wide_table_single_row_batches() {
+    fn batch_wide_table_respects_param_limit() {
         // 50 columns means max 2 rows per batch (100 / 50)
         let columns: Vec<String> = (0..50).map(|i| format!("col_{}", i)).collect();
         let rows: Vec<_> = (0..5)
@@ -275,6 +277,45 @@ mod tests {
         for batch in &batches {
             assert!(batch.rows.len() * columns.len() <= D1_MAX_BIND_PARAMS);
         }
+    }
+
+    #[test]
+    fn batch_over_100_columns_still_emits_rows() {
+        // 101 columns exceeds D1's param limit -- batch_rows should still
+        // produce single-row batches rather than dropping data
+        let columns: Vec<String> = (0..101).map(|i| format!("col_{}", i)).collect();
+        let rows: Vec<_> = (0..3)
+            .map(|i| {
+                let mut row = HashMap::new();
+                for col in &columns {
+                    row.insert(col.clone(), JsonValue::Number(i.into()));
+                }
+                row
+            })
+            .collect();
+
+        let config = BatchConfig {
+            batch_size: 100,
+            max_statement_bytes: 100_000,
+        };
+
+        let batches = batch_rows(&rows, &columns, &config);
+
+        // Should produce 3 single-row batches (no data dropped)
+        assert_eq!(batches.len(), 3);
+        for batch in &batches {
+            assert_eq!(batch.rows.len(), 1);
+        }
+    }
+
+    #[test]
+    fn empty_columns_returns_empty() {
+        let rows = vec![make_row(1, "test")];
+        let columns: Vec<String> = vec![];
+        let config = BatchConfig::default();
+
+        let batches = batch_rows(&rows, &columns, &config);
+        assert!(batches.is_empty());
     }
 
     #[test]

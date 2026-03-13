@@ -551,7 +551,8 @@ impl D1Client {
 
     /// Insert or replace rows using multi-row INSERT statements.
     ///
-    /// Uses the default batch configuration (100 rows, 90KB max).
+    /// Uses the default batch configuration. Effective batch size depends on
+    /// column count due to D1's 100 bind-parameter limit.
     pub async fn upsert_rows(
         &self,
         table: &str,
@@ -564,8 +565,8 @@ impl D1Client {
 
     /// Insert or replace rows with custom batch configuration.
     ///
-    /// Groups rows into batches respecting both count and size limits,
-    /// then executes multi-row INSERT statements for better performance.
+    /// Groups rows into batches respecting count, size, and D1 bind parameter
+    /// limits, then executes multi-row INSERT statements for better performance.
     pub async fn upsert_rows_batched(
         &self,
         table: &str,
@@ -583,11 +584,19 @@ impl D1Client {
         // Fail fast if a single row already exceeds D1's param limit
         if columns.len() > D1_MAX_BIND_PARAMS {
             return Err(SyncError::ParamLimitExceeded {
-                param_count: columns.len(),
+                table: table.to_string(),
                 row_count: 1,
                 col_count: columns.len(),
                 limit: D1_MAX_BIND_PARAMS,
             });
+        }
+
+        // Guard against empty columns (would cause division by zero)
+        if columns.is_empty() {
+            return Err(SyncError::Remote(format!(
+                "Table '{}' has no columns",
+                table
+            )));
         }
 
         let batches = batch_rows(rows, &columns, batch_config);
@@ -608,6 +617,16 @@ impl D1Client {
 
             if sql.is_empty() {
                 continue;
+            }
+
+            // Defense in depth: catch batch_rows bugs before hitting D1
+            if params.len() > D1_MAX_BIND_PARAMS {
+                return Err(SyncError::ParamLimitExceeded {
+                    table: table.to_string(),
+                    row_count: batch.rows.len(),
+                    col_count: columns.len(),
+                    limit: D1_MAX_BIND_PARAMS,
+                });
             }
 
             debug!(
