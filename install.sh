@@ -2,7 +2,7 @@
 # install.sh: Installer for Smuggler (https://github.com/ezmode-games/smuggler)
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/ezmode-games/smuggler/main/install.sh | bash
+#   curl -fsSL https://ezmode.games/oss/smuggler/install.sh | bash
 #   curl -fsSL ... | bash -s v0.2.0
 #   SMUGGLER_VERSION=v0.2.0 bash install.sh
 

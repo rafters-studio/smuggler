@@ -32,7 +32,7 @@ D1 is SQLite at the edge, but Cloudflare doesn't give you a way to sync your loc
 ### Quick install (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ezmode-games/smuggler/main/install.sh | bash
+curl -fsSL https://ezmode.games/oss/smuggler/install.sh | bash
 ```
 
 Detects your platform, downloads the right binary, verifies the checksum, and installs to `~/.local/bin/`. Supports Linux x64, macOS x64, and macOS ARM64.
@@ -40,7 +40,7 @@ Detects your platform, downloads the right binary, verifies the checksum, and in
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ezmode-games/smuggler/main/install.sh | bash -s v0.1.0
+curl -fsSL https://ezmode.games/oss/smuggler/install.sh | bash -s v0.1.0
 ```
 
 ### Manual download
