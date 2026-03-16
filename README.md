@@ -12,7 +12,7 @@ Smuggle data between SQLite and Cloudflare D1. Fast. Stateless. Questionable lif
 
 Running in production at [huttspawn.com](https://huttspawn.com) since early 2026. Pluggable data source architecture. CI across Linux, macOS, and Windows. Checksummed releases with a one-line installer.
 
-Not 1.0 yet -- the API surface may shift as we add [S3-compatible relay sync](https://github.com/ezmode-games/smuggler/issues/20). But the core sync engine is solid and battle-tested.
+Not 1.0 yet -- the API surface may still shift. But the core sync engine is solid and battle-tested, with S3-compatible relay sync for cross-machine workflows.
 
 There are [open issues](https://github.com/ezmode-games/smuggler/issues). We're shaving parsecs, not days.
 
@@ -100,10 +100,12 @@ smuggler push
 ## Commands
 
 ```
-smuggler status    # Can we phone home?
-smuggler diff      # What's different?
-smuggler push      # Local -> D1 (YOLO)
-smuggler pull      # D1 -> Local (safer YOLO)
+smuggler status      # Can we phone home?
+smuggler diff        # What's different?
+smuggler push        # Local -> D1 (YOLO)
+smuggler pull        # D1 -> Local (safer YOLO)
+smuggler stash       # Local -> S3 relay (cross-machine sync)
+smuggler retrieve    # S3 relay -> Local (cross-machine sync)
 ```
 
 ### Options
@@ -155,6 +157,59 @@ DataSource (trait)
 ```
 
 The diff engine (`diff_table`) and table resolution (`get_tables_to_sync`) are generic over any two `DataSource` implementations. This means the same comparison logic works whether you're syncing local-to-D1, local-to-local, or any future backend.
+
+## Cross-Machine Sync (Stash/Retrieve)
+
+Smuggler can sync your local SQLite database through an S3-compatible object store, enabling multiple dev machines to share state without going through D1.
+
+```
+Machine A                    S3/R2/GCS                  Machine B
+  local.sqlite  --stash-->  relay.sqlite  --retrieve-->  local.sqlite
+                <--retrieve--             <--stash--
+```
+
+### How it works
+
+Both sides are SQLite. Smuggler downloads the relay file from S3, opens it as a second `LocalDb`, and runs the same diff engine used for D1 sync. Only changed rows are transferred.
+
+- **`smuggler stash`** -- diffs local against the relay, applies changes to the relay, uploads it back to S3
+- **`smuggler retrieve`** -- downloads the relay from S3, diffs it against local, applies changes to local
+
+On first stash, Smuggler creates the relay from scratch and initializes its schema from the local database. ETag conditional writes prevent concurrent overwrites when multiple machines stash at the same time.
+
+### Stash configuration
+
+Add a `[stash]` section to your config (independent from D1 settings):
+
+```toml
+[stash]
+# S3-compatible URL to the relay file
+url = "s3://my-bucket/smuggler/relay.sqlite"
+
+# AWS credentials (optional if using instance roles or env vars)
+access_key_id = "AKIA..."
+secret_access_key = "..."
+region = "us-east-1"
+
+# Custom endpoint for Cloudflare R2, MinIO, etc.
+endpoint = "https://account-id.r2.cloudflarestorage.com"
+```
+
+Supported URL schemes:
+- `s3://bucket/path` -- Amazon S3 or any S3-compatible store (R2, MinIO)
+- `file:///absolute/path` -- Local filesystem (useful for testing)
+
+### Usage with automation
+
+Stash/retrieve pairs well with session hooks. For example, with [Legion](https://github.com/ezmode-games/legion):
+
+```bash
+# SessionStart hook
+smuggler retrieve && legion reindex
+
+# SessionStop hook
+smuggler stash
+```
 
 ## Configuration
 
