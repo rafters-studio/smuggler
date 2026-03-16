@@ -31,6 +31,7 @@ mod diff;
 mod error;
 mod local;
 mod remote;
+mod stash;
 mod sync;
 mod table;
 
@@ -98,6 +99,28 @@ enum Commands {
 
     /// Show configuration and connection status
     Status,
+
+    /// Stash local state to an S3-compatible relay (local -> S3)
+    Stash {
+        /// Specific table to stash (default: all configured tables)
+        #[arg(short, long)]
+        table: Option<String>,
+
+        /// Show what would be stashed without actually uploading
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Retrieve state from an S3-compatible relay (S3 -> local)
+    Retrieve {
+        /// Specific table to retrieve (default: all configured tables)
+        #[arg(short, long)]
+        table: Option<String>,
+
+        /// Show what would be retrieved without actually applying
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -134,6 +157,8 @@ async fn main() {
         Commands::Pull { table, dry_run } => run_pull(&config, table, dry_run).await,
         Commands::Diff { table } => run_diff(&config, table).await,
         Commands::Status => run_status(&config).await,
+        Commands::Stash { table, dry_run } => run_stash(&config, table, dry_run).await,
+        Commands::Retrieve { table, dry_run } => run_retrieve(&config, table, dry_run).await,
     };
 
     if let Err(e) = result {
@@ -166,22 +191,7 @@ async fn run_push(config: &Config, table: Option<String>, dry_run: bool) -> erro
     };
     let results = push_all(&local, &remote, config, tables, dry_run).await?;
 
-    // Print summary
-    println!("\n--- Push Summary ---");
-    let mut total_pushed = 0;
-    for result in &results {
-        if result.has_changes() {
-            println!("  {}: {} rows pushed", result.table, result.rows_pushed);
-            total_pushed += result.rows_pushed;
-        }
-    }
-
-    if total_pushed == 0 {
-        println!("  No changes to push");
-    } else if dry_run {
-        println!("\n  (dry run - no actual changes made)");
-    }
-
+    print_summary("Push", &results, |r| r.rows_pushed, "push", dry_run);
     Ok(())
 }
 
@@ -209,22 +219,7 @@ async fn run_pull(config: &Config, table: Option<String>, dry_run: bool) -> erro
     };
     let results = pull_all(&local, &remote, config, tables, dry_run).await?;
 
-    // Print summary
-    println!("\n--- Pull Summary ---");
-    let mut total_pulled = 0;
-    for result in &results {
-        if result.has_changes() {
-            println!("  {}: {} rows pulled", result.table, result.rows_pulled);
-            total_pulled += result.rows_pulled;
-        }
-    }
-
-    if total_pulled == 0 {
-        println!("  No changes to pull");
-    } else if dry_run {
-        println!("\n  (dry run - no actual changes made)");
-    }
-
+    print_summary("Pull", &results, |r| r.rows_pulled, "pull", dry_run);
     Ok(())
 }
 
@@ -279,6 +274,34 @@ async fn run_diff(config: &Config, table: Option<String>) -> error::Result<()> {
     }
 
     Ok(())
+}
+
+/// Print a sync summary (push, pull, stash, or retrieve).
+///
+/// `verb` is the lowercase action name used in the no-changes message
+/// (e.g. "No changes to push").
+fn print_summary(
+    heading: &str,
+    results: &[sync::SyncResult],
+    get_count: impl Fn(&sync::SyncResult) -> usize,
+    verb: &str,
+    dry_run: bool,
+) {
+    println!("\n--- {} Summary ---", heading);
+    let mut total = 0;
+    for result in results {
+        let count = get_count(result);
+        if count > 0 {
+            println!("  {}: {} rows", result.table, count);
+            total += count;
+        }
+    }
+
+    if total == 0 {
+        println!("  No changes to {}", verb);
+    } else if dry_run {
+        println!("\n  (dry run - no actual changes made)");
+    }
 }
 
 /// Print a diff category (e.g. "Local only") with up to 5 sample keys.
@@ -368,5 +391,50 @@ async fn run_status(config: &Config) -> error::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn require_stash_config(config: &Config) -> error::Result<&config::StashConfig> {
+    config
+        .stash
+        .as_ref()
+        .ok_or_else(|| error::SyncError::Config("No [stash] section in config".into()))
+}
+
+async fn run_stash(config: &Config, table: Option<String>, dry_run: bool) -> error::Result<()> {
+    let stash_config = require_stash_config(config)?;
+    info!("Stash mode: local -> S3 relay");
+
+    let results = stash::stash(
+        stash_config,
+        config.local_db_path(),
+        &config.sync.timestamp_column,
+        config.sync.conflict_resolution,
+        table,
+        dry_run,
+        &config.sync.exclude_tables,
+    )
+    .await?;
+
+    print_summary("Stash", &results, |r| r.rows_pushed, "stash", dry_run);
+    Ok(())
+}
+
+async fn run_retrieve(config: &Config, table: Option<String>, dry_run: bool) -> error::Result<()> {
+    let stash_config = require_stash_config(config)?;
+    info!("Retrieve mode: S3 relay -> local");
+
+    let results = stash::retrieve(
+        stash_config,
+        config.local_db_path(),
+        &config.sync.timestamp_column,
+        config.sync.conflict_resolution,
+        table,
+        dry_run,
+        &config.sync.exclude_tables,
+    )
+    .await?;
+
+    print_summary("Retrieve", &results, |r| r.rows_pulled, "retrieve", dry_run);
     Ok(())
 }
