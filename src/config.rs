@@ -16,6 +16,30 @@ pub struct Config {
 
     #[serde(default)]
     pub sync: SyncConfig,
+
+    /// Optional stash config for S3-compatible relay sync
+    pub stash: Option<StashConfig>,
+}
+
+/// Configuration for S3-compatible relay sync (stash/retrieve).
+///
+/// Supports S3, R2, GCS, Azure, and local filesystem URLs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StashConfig {
+    /// Object store URL: s3://bucket/path/relay.sqlite, file:///local/path, etc.
+    pub url: String,
+
+    /// AWS access key ID (optional if using instance roles or env vars)
+    pub access_key_id: Option<String>,
+
+    /// AWS secret access key
+    pub secret_access_key: Option<String>,
+
+    /// AWS region (default: us-east-1)
+    pub region: Option<String>,
+
+    /// Custom endpoint for R2, MinIO, etc.
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -318,6 +342,7 @@ mod tests {
             database_id: "test".into(),
             local_db: Some("test.db".into()),
             sync: SyncConfig::default(),
+            stash: None,
         };
 
         assert!(!config.should_sync_table("sqlite_sequence"));
@@ -336,6 +361,7 @@ mod tests {
                 tables: vec!["abilities".into(), "talents".into()],
                 ..Default::default()
             },
+            stash: None,
         };
 
         assert!(config.should_sync_table("abilities"));
@@ -432,6 +458,7 @@ mod tests {
                 initial_retry_delay_ms: 500,
                 ..Default::default()
             },
+            stash: None,
         };
 
         let retry = config.retry_config();

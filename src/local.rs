@@ -17,7 +17,7 @@ pub struct LocalDb {
 }
 
 impl LocalDb {
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().expect("mutex poisoned")
     }
 

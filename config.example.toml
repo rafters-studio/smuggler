@@ -86,3 +86,22 @@ max_retry_delay_ms = 60000
 # Each retry waits (previous_delay * backoff_multiplier)
 # Example with defaults: 1s -> 2s -> 4s -> 8s -> 16s
 backoff_multiplier = 2.0
+
+# =============================================================================
+# Stash Settings (optional)
+# =============================================================================
+# Configure S3-compatible relay sync for cross-machine synchronization.
+# Use `smuggler stash` to upload local state and `smuggler retrieve` to download.
+#
+# Supports:
+#   s3://bucket/path    - Amazon S3
+#   s3://bucket/path    - Cloudflare R2 (set endpoint below)
+#   s3://bucket/path    - MinIO (set endpoint below)
+#   file:///local/path  - Local filesystem (useful for testing)
+
+# [stash]
+# url = "s3://my-bucket/smuggler/relay.sqlite"
+# access_key_id = "your-access-key"
+# secret_access_key = "your-secret-key"
+# region = "us-east-1"
+# endpoint = "https://account-id.r2.cloudflarestorage.com"

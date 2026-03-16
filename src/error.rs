@@ -57,6 +57,23 @@ pub enum SyncError {
     #[error("Invalid table name '{name}'. Available tables: [{available}]")]
     InvalidTableName { name: String, available: String },
 
+    #[error("Object store error: {0}")]
+    ObjectStore(#[from] object_store::Error),
+
+    #[error("Stash error: {0}")]
+    Stash(String),
+
+    #[error("Invalid URL: {0}")]
+    InvalidUrl(String),
+
+    #[error("Relay not found at {0}")]
+    RelayNotFound(String),
+
+    #[error(
+        "Concurrent write conflict: relay was modified by another machine. Retry the operation."
+    )]
+    ConcurrentWrite,
+
     #[error(
         "D1 bind parameter limit exceeded for table '{table}': \
          query needs {} params ({row_count} rows x {col_count} columns), \
