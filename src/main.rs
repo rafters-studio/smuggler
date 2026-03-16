@@ -21,10 +21,12 @@
 //! - [`sync`] - Push/pull orchestration
 //! - [`error`] - Error types
 //! - [`table`] - Table name validation
+//! - [`datasource`] - DataSource trait for abstracting database backends
 //! - [`batch`] - Batch operations for multi-row upserts
 
 mod batch;
 mod config;
+mod datasource;
 mod diff;
 mod error;
 mod local;
@@ -33,6 +35,7 @@ mod sync;
 mod table;
 
 use crate::config::Config;
+use crate::datasource::DataSource;
 use crate::diff::diff_table;
 use crate::local::LocalDb;
 use crate::remote::D1Client;
@@ -185,7 +188,7 @@ async fn run_push(config: &Config, table: Option<String>, dry_run: bool) -> erro
 async fn run_pull(config: &Config, table: Option<String>, dry_run: bool) -> error::Result<()> {
     info!("Pull mode: D1 -> local");
 
-    let mut local = LocalDb::open(config.local_db_path())?;
+    let local = LocalDb::open(config.local_db_path())?;
     let remote = D1Client::with_retry_config(
         config.cloudflare_account_id.clone(),
         config.database_id.clone(),
@@ -204,7 +207,7 @@ async fn run_pull(config: &Config, table: Option<String>, dry_run: bool) -> erro
         }
         None => None,
     };
-    let results = pull_all(&mut local, &remote, config, tables, dry_run).await?;
+    let results = pull_all(&local, &remote, config, tables, dry_run).await?;
 
     // Print summary
     println!("\n--- Pull Summary ---");
@@ -261,80 +264,11 @@ async fn run_diff(config: &Config, table: Option<String>) -> error::Result<()> {
             println!("  {}", diff.summary());
 
             // Show details
-            if !diff.local_only.is_empty() {
-                println!(
-                    "    Local only: {}",
-                    diff.local_only
-                        .iter()
-                        .take(5)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                if diff.local_only.len() > 5 {
-                    println!("      ... and {} more", diff.local_only.len() - 5);
-                }
-            }
-
-            if !diff.remote_only.is_empty() {
-                println!(
-                    "    Remote only: {}",
-                    diff.remote_only
-                        .iter()
-                        .take(5)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                if diff.remote_only.len() > 5 {
-                    println!("      ... and {} more", diff.remote_only.len() - 5);
-                }
-            }
-
-            if !diff.local_newer.is_empty() {
-                println!(
-                    "    Local newer: {}",
-                    diff.local_newer
-                        .iter()
-                        .take(5)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                if diff.local_newer.len() > 5 {
-                    println!("      ... and {} more", diff.local_newer.len() - 5);
-                }
-            }
-
-            if !diff.remote_newer.is_empty() {
-                println!(
-                    "    Remote newer: {}",
-                    diff.remote_newer
-                        .iter()
-                        .take(5)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                if diff.remote_newer.len() > 5 {
-                    println!("      ... and {} more", diff.remote_newer.len() - 5);
-                }
-            }
-
-            if !diff.content_differs.is_empty() {
-                println!(
-                    "    Content differs: {}",
-                    diff.content_differs
-                        .iter()
-                        .take(5)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                if diff.content_differs.len() > 5 {
-                    println!("      ... and {} more", diff.content_differs.len() - 5);
-                }
-            }
+            print_diff_category("Local only", &diff.local_only);
+            print_diff_category("Remote only", &diff.remote_only);
+            print_diff_category("Local newer", &diff.local_newer);
+            print_diff_category("Remote newer", &diff.remote_newer);
+            print_diff_category("Content differs", &diff.content_differs);
         } else {
             println!("\n{}: in sync ({} rows)", table_name, diff.identical.len());
         }
@@ -345,6 +279,18 @@ async fn run_diff(config: &Config, table: Option<String>) -> error::Result<()> {
     }
 
     Ok(())
+}
+
+/// Print a diff category (e.g. "Local only") with up to 5 sample keys.
+fn print_diff_category(label: &str, keys: &[String]) {
+    if keys.is_empty() {
+        return;
+    }
+    let preview: Vec<_> = keys.iter().take(5).map(String::as_str).collect();
+    println!("    {}: {}", label, preview.join(", "));
+    if keys.len() > 5 {
+        println!("      ... and {} more", keys.len() - 5);
+    }
 }
 
 async fn run_status(config: &Config) -> error::Result<()> {
@@ -380,12 +326,12 @@ async fn run_status(config: &Config) -> error::Result<()> {
     match LocalDb::open_readonly(config.local_db_path()) {
         Ok(local) => {
             println!("  Connection: OK");
-            let tables = local.list_tables()?;
+            let tables = local.list_tables().await?;
             println!("  Tables: {}", tables.len());
 
             for table in &tables {
                 if config.should_sync_table(table) {
-                    let count = local.row_count(table)?;
+                    let count = local.row_count(table).await?;
                     println!("    {}: {} rows", table, count);
                 }
             }

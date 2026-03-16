@@ -1,6 +1,7 @@
 //! Sync orchestration
 
 use crate::config::{Config, ConflictResolution};
+use crate::datasource::DataSource;
 use crate::diff::{diff_table, TableDiff};
 use crate::error::Result;
 use crate::local::LocalDb;
@@ -30,7 +31,11 @@ impl SyncResult {
     }
 }
 
-/// Push local changes to remote (local -> D1)
+/// Push local changes to remote (local -> D1).
+///
+/// Takes concrete types rather than `DataSource` generics because
+/// `push` uses `D1Client::upsert_rows_batched` with progress callbacks,
+/// which is transport-specific and not part of the `DataSource` trait.
 pub async fn push_table(
     local: &LocalDb,
     remote: &D1Client,
@@ -60,7 +65,7 @@ pub async fn push_table(
     }
 
     // Fetch full row data from local
-    let rows = local.get_rows(table, &rows_to_push)?;
+    let rows = local.get_rows(table, &rows_to_push).await?;
 
     if rows.is_empty() {
         warn!("No rows found locally for push");
@@ -91,7 +96,7 @@ pub async fn push_table(
 
 /// Pull remote changes to local (D1 -> local)
 pub async fn pull_table(
-    local: &mut LocalDb,
+    local: &LocalDb,
     remote: &D1Client,
     table: &str,
     diff: &TableDiff,
@@ -135,7 +140,7 @@ pub async fn pull_table(
     );
     pb.set_message(format!("Pulling {}", table));
 
-    let count = local.upsert_rows(table, &rows)?;
+    let count = local.upsert_rows(table, &rows).await?;
     result.rows_pulled = count;
 
     pb.finish_with_message(format!("Pulled {} rows", result.rows_pulled));
@@ -144,13 +149,14 @@ pub async fn pull_table(
 }
 
 /// Get list of tables to sync based on config
-pub async fn get_tables_to_sync(
-    local: &LocalDb,
-    remote: &D1Client,
+pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
+    local: &A,
+    remote: &B,
     config: &Config,
 ) -> Result<Vec<String>> {
     // Get tables from both sides
-    let local_tables: std::collections::HashSet<_> = local.list_tables()?.into_iter().collect();
+    let local_tables: std::collections::HashSet<_> =
+        local.list_tables().await?.into_iter().collect();
     let remote_tables: std::collections::HashSet<_> =
         remote.list_tables().await?.into_iter().collect();
 
@@ -164,7 +170,7 @@ pub async fn get_tables_to_sync(
     // Filter out tables without primary keys (required for change detection)
     let mut syncable = Vec::new();
     for table in common {
-        match local.table_info(&table) {
+        match local.table_info(&table).await {
             Ok(info) if !info.primary_key.is_empty() => {
                 syncable.push(table);
             }
@@ -238,7 +244,7 @@ pub async fn push_all(
 
 /// Pull all tables
 pub async fn pull_all(
-    local: &mut LocalDb,
+    local: &LocalDb,
     remote: &D1Client,
     config: &Config,
     tables: Option<Vec<String>>,

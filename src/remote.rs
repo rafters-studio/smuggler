@@ -1,8 +1,8 @@
 //! Cloudflare D1 HTTP API client
 
 use crate::config::RetryConfig;
+use crate::datasource::{ColumnInfo, DataSource, RowMeta, TableInfo};
 use crate::error::{Result, SyncError};
-use crate::local::RowMeta;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -189,18 +189,14 @@ impl D1Client {
         )
     }
 
-    /// Execute a SQL query (internal, without retry)
-    async fn query_internal(
-        &self,
-        sql: &str,
-        params: Vec<JsonValue>,
-    ) -> Result<Vec<HashMap<String, JsonValue>>> {
+    /// Send a SQL statement to D1 and return the parsed response (without retry).
+    async fn send_request(&self, sql: &str, params: Vec<JsonValue>) -> Result<D1Result> {
         let request = D1Request {
             sql: sql.to_string(),
             params,
         };
 
-        debug!("D1 query: {}", sql);
+        debug!("D1 request: {}", sql);
 
         let response = self
             .client
@@ -218,7 +214,6 @@ impl D1Client {
             })?;
 
         let status = response.status();
-        // Extract Retry-After header before consuming response body
         let retry_after = extract_retry_after_header(response.headers());
         let body = response.text().await?;
 
@@ -240,16 +235,23 @@ impl D1Client {
             return Err(SyncError::Remote("Unknown D1 error".to_string()));
         }
 
-        let results = d1_response
+        Ok(d1_response
             .result
-            .and_then(|r| r.into_iter().next())
-            .and_then(|r| r.results)
-            .unwrap_or_default();
-
-        Ok(results)
+            .and_then(|mut r| {
+                if r.is_empty() {
+                    None
+                } else {
+                    Some(r.remove(0))
+                }
+            })
+            .unwrap_or(D1Result {
+                results: None,
+                success: true,
+                meta: None,
+            }))
     }
 
-    /// Execute a SQL query with retry
+    /// Execute a SQL query with retry, returning result rows.
     async fn query(
         &self,
         sql: &str,
@@ -259,75 +261,24 @@ impl D1Client {
         with_retry(&self.retry_config, || {
             let sql = sql.clone();
             let params = params.clone();
-            async move { self.query_internal(&sql, params).await }
+            async move {
+                let result = self.send_request(&sql, params).await?;
+                Ok(result.results.unwrap_or_default())
+            }
         })
         .await
     }
 
-    /// Execute a write query (internal, without retry)
-    async fn execute_internal(&self, sql: &str, params: Vec<JsonValue>) -> Result<i64> {
-        let request = D1Request {
-            sql: sql.to_string(),
-            params,
-        };
-
-        debug!("D1 execute: {}", sql);
-
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.api_token)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    SyncError::ConnectionTimeout
-                } else {
-                    SyncError::Http(e)
-                }
-            })?;
-
-        let status = response.status();
-        // Extract Retry-After header before consuming response body
-        let retry_after = extract_retry_after_header(response.headers());
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            return Err(parse_http_error(status, &body, retry_after));
-        }
-
-        let d1_response: D1Response = serde_json::from_str(&body)?;
-
-        if !d1_response.success {
-            if let Some(errors) = d1_response.errors {
-                if let Some(err) = errors.first() {
-                    return Err(SyncError::D1Api {
-                        message: err.message.clone(),
-                        code: err.code,
-                    });
-                }
-            }
-            return Err(SyncError::Remote("Unknown D1 error".to_string()));
-        }
-
-        let changes = d1_response
-            .result
-            .and_then(|r| r.into_iter().next())
-            .and_then(|r| r.meta)
-            .and_then(|m| m.changes)
-            .unwrap_or(0);
-
-        Ok(changes)
-    }
-
-    /// Execute a write query (INSERT, UPDATE, DELETE) with retry
+    /// Execute a write query (INSERT, UPDATE, DELETE) with retry, returning change count.
     async fn execute(&self, sql: &str, params: Vec<JsonValue>) -> Result<i64> {
         let sql = sql.to_string();
         with_retry(&self.retry_config, || {
             let sql = sql.clone();
             let params = params.clone();
-            async move { self.execute_internal(&sql, params).await }
+            async move {
+                let result = self.send_request(&sql, params).await?;
+                Ok(result.meta.and_then(|m| m.changes).unwrap_or(0))
+            }
         })
         .await
     }
@@ -343,8 +294,139 @@ impl D1Client {
         Ok(())
     }
 
-    /// List all tables in D1
-    pub async fn list_tables(&self) -> Result<Vec<String>> {
+    /// Delete rows by primary key
+    #[allow(dead_code)]
+    pub async fn delete_rows(&self, table: &str, pk_values: &[String]) -> Result<usize> {
+        if pk_values.is_empty() {
+            return Ok(0);
+        }
+
+        let info = self.table_info(table).await?;
+        let pk_expr = info
+            .primary_key
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(" || '|' || ");
+
+        let mut total_changes = 0;
+
+        // Delete in batches respecting D1 bind parameter limit
+        let batch_size = crate::batch::D1_MAX_BIND_PARAMS;
+        for chunk in pk_values.chunks(batch_size) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "DELETE FROM \"{}\" WHERE {} IN ({})",
+                table, pk_expr, placeholders
+            );
+
+            let params: Vec<JsonValue> =
+                chunk.iter().map(|v| JsonValue::String(v.clone())).collect();
+            let changes = self.execute(&sql, params).await?;
+            total_changes += changes as usize;
+        }
+
+        info!("Deleted {} rows from D1 table {}", total_changes, table);
+        Ok(total_changes)
+    }
+
+    /// Insert or replace rows with custom batch configuration.
+    ///
+    /// Groups rows into batches respecting count, size, and D1 bind parameter
+    /// limits, then executes multi-row INSERT statements for better performance.
+    ///
+    /// `on_batch` is called after each batch completes with the number of rows
+    /// in that batch, allowing callers to update progress indicators.
+    pub async fn upsert_rows_batched(
+        &self,
+        table: &str,
+        rows: &[HashMap<String, JsonValue>],
+        batch_config: &crate::config::BatchConfig,
+        on_batch: impl Fn(usize),
+    ) -> Result<usize> {
+        use crate::batch::{batch_rows, generate_batch_insert, D1_MAX_BIND_PARAMS};
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let info = self.table_info(table).await?;
+        let columns: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
+
+        // Fail fast if a single row already exceeds D1's param limit
+        if columns.len() > D1_MAX_BIND_PARAMS {
+            return Err(SyncError::ParamLimitExceeded {
+                table: table.to_string(),
+                row_count: 1,
+                col_count: columns.len(),
+                limit: D1_MAX_BIND_PARAMS,
+            });
+        }
+
+        // Guard against empty columns (would cause division by zero)
+        if columns.is_empty() {
+            return Err(SyncError::Remote(format!(
+                "Table '{}' has no columns",
+                table
+            )));
+        }
+
+        let batches = batch_rows(rows, &columns, batch_config);
+
+        let mut total_changes = 0;
+
+        debug!(
+            "Upserting {} rows in {} batches to table {} ({} cols, max {} rows/batch by param limit)",
+            rows.len(),
+            batches.len(),
+            table,
+            columns.len(),
+            D1_MAX_BIND_PARAMS / columns.len(),
+        );
+
+        for (i, batch) in batches.iter().enumerate() {
+            let (sql, params) = generate_batch_insert(table, &columns, &batch.rows);
+
+            if sql.is_empty() {
+                continue;
+            }
+
+            // Defense in depth: catch batch_rows bugs before hitting D1
+            if params.len() > D1_MAX_BIND_PARAMS {
+                return Err(SyncError::ParamLimitExceeded {
+                    table: table.to_string(),
+                    row_count: batch.rows.len(),
+                    col_count: columns.len(),
+                    limit: D1_MAX_BIND_PARAMS,
+                });
+            }
+
+            debug!(
+                "Batch {}/{}: {} rows, {} params, ~{} bytes",
+                i + 1,
+                batches.len(),
+                batch.rows.len(),
+                params.len(),
+                batch.estimated_bytes
+            );
+
+            let changes = self.execute(&sql, params).await?;
+            total_changes += changes as usize;
+            on_batch(batch.rows.len());
+        }
+
+        info!(
+            "Upserted {} rows into D1 table {} ({} batches)",
+            total_changes,
+            table,
+            batches.len()
+        );
+        Ok(total_changes)
+    }
+}
+
+impl DataSource for D1Client {
+    async fn list_tables(&self) -> Result<Vec<String>> {
         let results = self
             .query(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -365,64 +447,70 @@ impl D1Client {
         Ok(tables)
     }
 
-    /// Get table column info
-    pub async fn table_columns(&self, table: &str) -> Result<Vec<String>> {
+    async fn table_info(&self, table: &str) -> Result<TableInfo> {
         let results = self
             .query(&format!("PRAGMA table_info(\"{}\")", table), vec![])
             .await?;
 
-        let columns: Vec<String> = results
+        let columns: Vec<ColumnInfo> = results
             .into_iter()
-            .filter_map(|row| {
-                row.get("name")
+            .map(|row| ColumnInfo {
+                name: row
+                    .get("name")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-
-        Ok(columns)
-    }
-
-    /// Get primary key columns for a table
-    pub async fn primary_key_columns(&self, table: &str) -> Result<Vec<String>> {
-        let results = self
-            .query(&format!("PRAGMA table_info(\"{}\")", table), vec![])
-            .await?;
-
-        let pk_cols: Vec<String> = results
-            .into_iter()
-            .filter(|row| {
-                row.get("pk")
+                    .unwrap_or("")
+                    .to_string(),
+                col_type: row
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                notnull: row
+                    .get("notnull")
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n != 0)
+                    .unwrap_or(false),
+                pk: row
+                    .get("pk")
                     .and_then(|v| v.as_i64())
                     .map(|n| n > 0)
-                    .unwrap_or(false)
-            })
-            .filter_map(|row| {
-                row.get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
+                    .unwrap_or(false),
             })
             .collect();
 
-        if pk_cols.is_empty() {
+        if columns.is_empty() {
+            return Err(SyncError::TableNotFound(table.to_string()));
+        }
+
+        let primary_key: Vec<String> = columns
+            .iter()
+            .filter(|c| c.pk)
+            .map(|c| c.name.clone())
+            .collect();
+
+        if primary_key.is_empty() {
             return Err(SyncError::NoPrimaryKey(table.to_string()));
         }
 
-        Ok(pk_cols)
+        Ok(TableInfo {
+            name: table.to_string(),
+            columns,
+            primary_key,
+        })
     }
 
-    /// Get row metadata for change detection
-    pub async fn get_row_metadata(
+    async fn get_row_metadata(
         &self,
         table: &str,
         timestamp_column: &str,
     ) -> Result<HashMap<String, RowMeta>> {
-        let pk_cols = self.primary_key_columns(table).await?;
-        let columns = self.table_columns(table).await?;
+        let info = self.table_info(table).await?;
+        let columns: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
         let has_timestamp = columns.iter().any(|c| c == timestamp_column);
 
         // Build the SELECT query
-        let pk_select = pk_cols
+        let pk_select = info
+            .primary_key
             .iter()
             .map(|c| format!("\"{}\"", c))
             .collect::<Vec<_>>()
@@ -501,8 +589,7 @@ impl D1Client {
         Ok(metadata)
     }
 
-    /// Get full row data for specific primary keys
-    pub async fn get_rows(
+    async fn get_rows(
         &self,
         table: &str,
         pk_values: &[String],
@@ -511,25 +598,23 @@ impl D1Client {
             return Ok(vec![]);
         }
 
-        let pk_cols = self.primary_key_columns(table).await?;
-        let columns = self.table_columns(table).await?;
+        let info = self.table_info(table).await?;
 
-        let pk_expr = pk_cols
+        let pk_expr = info
+            .primary_key
             .iter()
             .map(|c| format!("\"{}\"", c))
             .collect::<Vec<_>>()
             .join(" || '|' || ");
 
-        let cols = columns
+        let cols = info
+            .columns
             .iter()
-            .map(|c| format!("\"{}\"", c))
+            .map(|c| format!("\"{}\"", c.name))
             .collect::<Vec<_>>()
             .join(", ");
 
         // D1 allows at most 100 bind params per query.
-        // For single-column PKs that's 100 rows; for composite PKs
-        // each row still contributes one param to the IN clause (the
-        // concatenated PK expression is compared server-side), so 100 is safe.
         let batch_size = crate::batch::D1_MAX_BIND_PARAMS;
         let mut all_results = Vec::new();
 
@@ -549,151 +634,13 @@ impl D1Client {
         Ok(all_results)
     }
 
-    /// Insert or replace rows using multi-row INSERT statements.
-    ///
-    /// Uses the default batch configuration. Effective batch size depends on
-    /// column count due to D1's 100 bind-parameter limit.
-    #[allow(dead_code)]
-    pub async fn upsert_rows(
-        &self,
-        table: &str,
-        rows: &[HashMap<String, JsonValue>],
-    ) -> Result<usize> {
+    async fn upsert_rows(&self, table: &str, rows: &[HashMap<String, JsonValue>]) -> Result<usize> {
         use crate::config::BatchConfig;
         self.upsert_rows_batched(table, rows, &BatchConfig::default(), |_| {})
             .await
     }
 
-    /// Insert or replace rows with custom batch configuration.
-    ///
-    /// Groups rows into batches respecting count, size, and D1 bind parameter
-    /// limits, then executes multi-row INSERT statements for better performance.
-    ///
-    /// `on_batch` is called after each batch completes with the number of rows
-    /// in that batch, allowing callers to update progress indicators.
-    pub async fn upsert_rows_batched(
-        &self,
-        table: &str,
-        rows: &[HashMap<String, JsonValue>],
-        batch_config: &crate::config::BatchConfig,
-        on_batch: impl Fn(usize),
-    ) -> Result<usize> {
-        use crate::batch::{batch_rows, generate_batch_insert, D1_MAX_BIND_PARAMS};
-
-        if rows.is_empty() {
-            return Ok(0);
-        }
-
-        let columns = self.table_columns(table).await?;
-
-        // Fail fast if a single row already exceeds D1's param limit
-        if columns.len() > D1_MAX_BIND_PARAMS {
-            return Err(SyncError::ParamLimitExceeded {
-                table: table.to_string(),
-                row_count: 1,
-                col_count: columns.len(),
-                limit: D1_MAX_BIND_PARAMS,
-            });
-        }
-
-        // Guard against empty columns (would cause division by zero)
-        if columns.is_empty() {
-            return Err(SyncError::Remote(format!(
-                "Table '{}' has no columns",
-                table
-            )));
-        }
-
-        let batches = batch_rows(rows, &columns, batch_config);
-
-        let mut total_changes = 0;
-
-        debug!(
-            "Upserting {} rows in {} batches to table {} ({} cols, max {} rows/batch by param limit)",
-            rows.len(),
-            batches.len(),
-            table,
-            columns.len(),
-            D1_MAX_BIND_PARAMS / columns.len(),
-        );
-
-        for (i, batch) in batches.iter().enumerate() {
-            let (sql, params) = generate_batch_insert(table, &columns, &batch.rows);
-
-            if sql.is_empty() {
-                continue;
-            }
-
-            // Defense in depth: catch batch_rows bugs before hitting D1
-            if params.len() > D1_MAX_BIND_PARAMS {
-                return Err(SyncError::ParamLimitExceeded {
-                    table: table.to_string(),
-                    row_count: batch.rows.len(),
-                    col_count: columns.len(),
-                    limit: D1_MAX_BIND_PARAMS,
-                });
-            }
-
-            debug!(
-                "Batch {}/{}: {} rows, {} params, ~{} bytes",
-                i + 1,
-                batches.len(),
-                batch.rows.len(),
-                params.len(),
-                batch.estimated_bytes
-            );
-
-            let changes = self.execute(&sql, params).await?;
-            total_changes += changes as usize;
-            on_batch(batch.rows.len());
-        }
-
-        info!(
-            "Upserted {} rows into D1 table {} ({} batches)",
-            total_changes,
-            table,
-            batches.len()
-        );
-        Ok(total_changes)
-    }
-
-    /// Delete rows by primary key
-    #[allow(dead_code)]
-    pub async fn delete_rows(&self, table: &str, pk_values: &[String]) -> Result<usize> {
-        if pk_values.is_empty() {
-            return Ok(0);
-        }
-
-        let pk_cols = self.primary_key_columns(table).await?;
-        let pk_expr = pk_cols
-            .iter()
-            .map(|c| format!("\"{}\"", c))
-            .collect::<Vec<_>>()
-            .join(" || '|' || ");
-
-        let mut total_changes = 0;
-
-        // Delete in batches respecting D1 bind parameter limit
-        let batch_size = crate::batch::D1_MAX_BIND_PARAMS;
-        for chunk in pk_values.chunks(batch_size) {
-            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            let sql = format!(
-                "DELETE FROM \"{}\" WHERE {} IN ({})",
-                table, pk_expr, placeholders
-            );
-
-            let params: Vec<JsonValue> =
-                chunk.iter().map(|v| JsonValue::String(v.clone())).collect();
-            let changes = self.execute(&sql, params).await?;
-            total_changes += changes as usize;
-        }
-
-        info!("Deleted {} rows from D1 table {}", total_changes, table);
-        Ok(total_changes)
-    }
-
-    /// Get row count for a table
-    pub async fn row_count(&self, table: &str) -> Result<usize> {
+    async fn row_count(&self, table: &str) -> Result<usize> {
         let results = self
             .query(
                 &format!("SELECT COUNT(*) as count FROM \"{}\"", table),

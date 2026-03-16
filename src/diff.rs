@@ -1,9 +1,8 @@
 //! Change detection between local and remote databases
 
 use crate::config::ConflictResolution;
+use crate::datasource::DataSource;
 use crate::error::Result;
-use crate::local::LocalDb;
-use crate::remote::D1Client;
 use std::collections::HashSet;
 use tracing::{debug, info};
 
@@ -135,17 +134,17 @@ impl TableDiff {
     }
 }
 
-/// Compare local and remote data for a table
-pub async fn diff_table(
-    local: &LocalDb,
-    remote: &D1Client,
+/// Compare two data sources for a table
+pub async fn diff_table<A: DataSource, B: DataSource>(
+    local: &A,
+    remote: &B,
     table: &str,
     timestamp_column: &str,
 ) -> Result<TableDiff> {
     info!("Computing diff for table: {}", table);
 
     // Get metadata from both sides
-    let local_meta = local.get_row_metadata(table, timestamp_column)?;
+    let local_meta = local.get_row_metadata(table, timestamp_column).await?;
     let remote_meta = remote.get_row_metadata(table, timestamp_column).await?;
 
     let local_keys: HashSet<&String> = local_meta.keys().collect();
@@ -210,9 +209,9 @@ pub async fn diff_table(
 /// Compare all tables
 /// Reserved for batch operations
 #[allow(dead_code)]
-pub async fn diff_all(
-    local: &LocalDb,
-    remote: &D1Client,
+pub async fn diff_all<A: DataSource, B: DataSource>(
+    local: &A,
+    remote: &B,
     tables: &[String],
     timestamp_column: &str,
 ) -> Result<Vec<TableDiff>> {
