@@ -40,7 +40,7 @@ use crate::datasource::DataSource;
 use crate::diff::diff_table;
 use crate::local::LocalDb;
 use crate::remote::D1Client;
-use crate::sync::{get_tables_to_sync, pull_all, push_all};
+use crate::sync::{get_tables_to_sync, pull_all, push_all, sync_all};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing::{error, info, Level};
@@ -100,6 +100,17 @@ enum Commands {
     /// Show configuration and connection status
     Status,
 
+    /// Bidirectional sync (push + pull in one operation)
+    Sync {
+        /// Specific table to sync (default: all configured tables)
+        #[arg(short, long)]
+        table: Option<String>,
+
+        /// Show what would be synced without actually syncing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Stash local state to an S3-compatible relay (local -> S3)
     Stash {
         /// Specific table to stash (default: all configured tables)
@@ -155,6 +166,7 @@ async fn main() {
     let result = match cli.command {
         Commands::Push { table, dry_run } => run_push(&config, table, dry_run).await,
         Commands::Pull { table, dry_run } => run_pull(&config, table, dry_run).await,
+        Commands::Sync { table, dry_run } => run_sync(&config, table, dry_run).await,
         Commands::Diff { table } => run_diff(&config, table).await,
         Commands::Status => run_status(&config).await,
         Commands::Stash { table, dry_run } => run_stash(&config, table, dry_run).await,
@@ -220,6 +232,52 @@ async fn run_pull(config: &Config, table: Option<String>, dry_run: bool) -> erro
     let results = pull_all(&local, &remote, config, tables, dry_run).await?;
 
     print_summary("Pull", &results, |r| r.rows_pulled, "pull", dry_run);
+    Ok(())
+}
+
+async fn run_sync(config: &Config, table: Option<String>, dry_run: bool) -> error::Result<()> {
+    info!("Sync mode: bidirectional");
+
+    let local = LocalDb::open(config.local_db_path())?;
+    let remote = D1Client::with_retry_config(
+        config.cloudflare_account_id.clone(),
+        config.database_id.clone(),
+        config.cloudflare_api_token.clone(),
+        config.retry_config(),
+    );
+
+    remote.test_connection().await?;
+
+    let tables = match table {
+        Some(t) => {
+            let schema = local.get_schema()?;
+            let _ = schema.validate(&t)?;
+            Some(vec![t])
+        }
+        None => None,
+    };
+    let results = sync_all(&local, &remote, config, tables, dry_run).await?;
+
+    println!("\n--- Sync Summary ---");
+    let mut total_pushed = 0;
+    let mut total_pulled = 0;
+    for result in &results {
+        if result.has_changes() {
+            println!(
+                "  {}: {} pushed, {} pulled",
+                result.table, result.rows_pushed, result.rows_pulled
+            );
+            total_pushed += result.rows_pushed;
+            total_pulled += result.rows_pulled;
+        }
+    }
+
+    if total_pushed == 0 && total_pulled == 0 {
+        println!("  No changes to sync");
+    } else if dry_run {
+        println!("\n  (dry run - no actual changes made)");
+    }
+
     Ok(())
 }
 

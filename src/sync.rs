@@ -1,13 +1,18 @@
 //! Sync orchestration
+//!
+//! All sync functions are generic over the [`DataSource`] trait, enabling
+//! any pair of data sources (local<->local, local<->D1, local<->S3, etc.)
+//! to sync using the same diff-and-apply engine.
 
 use crate::config::{Config, ConflictResolution};
 use crate::datasource::DataSource;
 use crate::diff::{diff_table, TableDiff};
 use crate::error::Result;
-use crate::local::LocalDb;
-use crate::remote::D1Client;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
+
+/// Default chunk size for upsert operations when transferring rows.
+const TRANSFER_CHUNK_SIZE: usize = 100;
 
 /// Result of a sync operation
 #[derive(Debug)]
@@ -31,14 +36,52 @@ impl SyncResult {
     }
 }
 
-/// Push local changes to remote (local -> D1).
+fn progress_bar(total: u64, message: String) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
+            .unwrap(),
+    );
+    pb.set_message(message);
+    pb
+}
+
+/// Transfer rows from one DataSource to another.
 ///
-/// Takes concrete types rather than `DataSource` generics because
-/// `push` uses `D1Client::upsert_rows_batched` with progress callbacks,
-/// which is transport-specific and not part of the `DataSource` trait.
-pub async fn push_table(
-    local: &LocalDb,
-    remote: &D1Client,
+/// Fetches rows by primary key from `source`, then upserts into `dest`
+/// in chunks with progress display.
+async fn transfer_rows<S: DataSource, D: DataSource>(
+    source: &S,
+    dest: &D,
+    table: &str,
+    pk_values: &[String],
+    label: &str,
+) -> Result<usize> {
+    let rows = source.get_rows(table, pk_values).await?;
+
+    if rows.is_empty() {
+        warn!("No rows found in source for {}", label);
+        return Ok(0);
+    }
+
+    let pb = progress_bar(rows.len() as u64, format!("{} {}", label, table));
+    let mut total = 0;
+
+    for chunk in rows.chunks(TRANSFER_CHUNK_SIZE) {
+        let count = dest.upsert_rows(table, chunk).await?;
+        total += count;
+        pb.inc(chunk.len() as u64);
+    }
+
+    pb.finish_with_message(format!("{} {} rows", label, total));
+    Ok(total)
+}
+
+/// Push changes from source to destination for a single table.
+pub async fn push_table<S: DataSource, D: DataSource>(
+    source: &S,
+    dest: &D,
     table: &str,
     diff: &TableDiff,
     conflict_resolution: ConflictResolution,
@@ -64,40 +107,14 @@ pub async fn push_table(
         return Ok(result);
     }
 
-    // Fetch full row data from local
-    let rows = local.get_rows(table, &rows_to_push).await?;
-
-    if rows.is_empty() {
-        warn!("No rows found locally for push");
-        return Ok(result);
-    }
-
-    // Upsert to remote (batch system handles D1 param limits)
-    let pb = ProgressBar::new(rows.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-            .unwrap(),
-    );
-    pb.set_message(format!("Pushing {}", table));
-
-    let batch_config = crate::config::BatchConfig::default();
-    let count = remote
-        .upsert_rows_batched(table, &rows, &batch_config, |batch_len| {
-            pb.inc(batch_len as u64);
-        })
-        .await?;
-    result.rows_pushed = count;
-
-    pb.finish_with_message(format!("Pushed {} rows", result.rows_pushed));
-
+    result.rows_pushed = transfer_rows(source, dest, table, &rows_to_push, "Pushing").await?;
     Ok(result)
 }
 
-/// Pull remote changes to local (D1 -> local)
-pub async fn pull_table(
-    local: &LocalDb,
-    remote: &D1Client,
+/// Pull changes from source to destination for a single table.
+pub async fn pull_table<S: DataSource, D: DataSource>(
+    local: &D,
+    remote: &S,
     table: &str,
     diff: &TableDiff,
     conflict_resolution: ConflictResolution,
@@ -123,29 +140,34 @@ pub async fn pull_table(
         return Ok(result);
     }
 
-    // Fetch full row data from remote
-    let rows = remote.get_rows(table, &rows_to_pull).await?;
+    result.rows_pulled = transfer_rows(remote, local, table, &rows_to_pull, "Pulling").await?;
+    Ok(result)
+}
 
-    if rows.is_empty() {
-        warn!("No rows found remotely for pull");
-        return Ok(result);
+/// Bidirectional sync of a single table: push source->dest and pull dest->source.
+pub async fn sync_table<A: DataSource, B: DataSource>(
+    a: &A,
+    b: &B,
+    table: &str,
+    timestamp_column: &str,
+    conflict_resolution: ConflictResolution,
+    dry_run: bool,
+) -> Result<SyncResult> {
+    let diff = diff_table(a, b, table, timestamp_column).await?;
+
+    if !diff.has_changes() {
+        info!("Table {} is in sync", table);
+        return Ok(SyncResult::new(table));
     }
 
-    // Upsert to local
-    let pb = ProgressBar::new(rows.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-            .unwrap(),
-    );
-    pb.set_message(format!("Pulling {}", table));
+    let push_result = push_table(a, b, table, &diff, conflict_resolution, dry_run).await?;
+    let pull_result = pull_table(a, b, table, &diff, conflict_resolution, dry_run).await?;
 
-    let count = local.upsert_rows(table, &rows).await?;
-    result.rows_pulled = count;
-
-    pb.finish_with_message(format!("Pulled {} rows", result.rows_pulled));
-
-    Ok(result)
+    Ok(SyncResult {
+        table: table.to_string(),
+        rows_pushed: push_result.rows_pushed,
+        rows_pulled: pull_result.rows_pulled,
+    })
 }
 
 /// Get list of tables to sync based on config
@@ -154,20 +176,17 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
     remote: &B,
     config: &Config,
 ) -> Result<Vec<String>> {
-    // Get tables from both sides
     let local_tables: std::collections::HashSet<_> =
         local.list_tables().await?.into_iter().collect();
     let remote_tables: std::collections::HashSet<_> =
         remote.list_tables().await?.into_iter().collect();
 
-    // Find common tables
     let common: Vec<String> = local_tables
         .intersection(&remote_tables)
         .filter(|t| config.should_sync_table(t))
         .cloned()
         .collect();
 
-    // Filter out tables without primary keys (required for change detection)
     let mut syncable = Vec::new();
     for table in common {
         match local.table_info(&table).await {
@@ -186,16 +205,15 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
         }
     }
 
-    // Warn about tables only on one side
     for table in local_tables.difference(&remote_tables) {
         if config.should_sync_table(table) {
-            warn!("Table '{}' exists only in local database", table);
+            warn!("Table '{}' exists only in source", table);
         }
     }
 
     for table in remote_tables.difference(&local_tables) {
         if config.should_sync_table(table) {
-            warn!("Table '{}' exists only in remote D1", table);
+            warn!("Table '{}' exists only in destination", table);
         }
     }
 
@@ -203,23 +221,23 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
     Ok(syncable)
 }
 
-/// Push all tables
-pub async fn push_all(
-    local: &LocalDb,
-    remote: &D1Client,
+/// Push all tables from source to destination.
+pub async fn push_all<S: DataSource, D: DataSource>(
+    source: &S,
+    dest: &D,
     config: &Config,
     tables: Option<Vec<String>>,
     dry_run: bool,
 ) -> Result<Vec<SyncResult>> {
     let tables_to_sync = match tables {
         Some(t) => t,
-        None => get_tables_to_sync(local, remote, config).await?,
+        None => get_tables_to_sync(source, dest, config).await?,
     };
 
     let mut results = Vec::new();
 
     for table in &tables_to_sync {
-        let diff = diff_table(local, remote, table, &config.sync.timestamp_column).await?;
+        let diff = diff_table(source, dest, table, &config.sync.timestamp_column).await?;
 
         if !diff.has_changes() {
             info!("Table {} is in sync", table);
@@ -228,8 +246,8 @@ pub async fn push_all(
         }
 
         let result = push_table(
-            local,
-            remote,
+            source,
+            dest,
             table,
             &diff,
             config.sync.conflict_resolution,
@@ -242,10 +260,10 @@ pub async fn push_all(
     Ok(results)
 }
 
-/// Pull all tables
-pub async fn pull_all(
-    local: &LocalDb,
-    remote: &D1Client,
+/// Pull all tables from source to destination.
+pub async fn pull_all<S: DataSource, D: DataSource>(
+    local: &D,
+    remote: &S,
     config: &Config,
     tables: Option<Vec<String>>,
     dry_run: bool,
@@ -271,6 +289,37 @@ pub async fn pull_all(
             remote,
             table,
             &diff,
+            config.sync.conflict_resolution,
+            dry_run,
+        )
+        .await?;
+        results.push(result);
+    }
+
+    Ok(results)
+}
+
+/// Bidirectional sync of all tables.
+pub async fn sync_all<A: DataSource, B: DataSource>(
+    a: &A,
+    b: &B,
+    config: &Config,
+    tables: Option<Vec<String>>,
+    dry_run: bool,
+) -> Result<Vec<SyncResult>> {
+    let tables_to_sync = match tables {
+        Some(t) => t,
+        None => get_tables_to_sync(a, b, config).await?,
+    };
+
+    let mut results = Vec::new();
+
+    for table in &tables_to_sync {
+        let result = sync_table(
+            a,
+            b,
+            table,
+            &config.sync.timestamp_column,
             config.sync.conflict_resolution,
             dry_run,
         )
