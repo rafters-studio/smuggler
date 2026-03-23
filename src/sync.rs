@@ -4,15 +4,12 @@
 //! any pair of data sources (local<->local, local<->D1, local<->S3, etc.)
 //! to sync using the same diff-and-apply engine.
 
-use crate::config::{Config, ConflictResolution};
+use crate::config::{BatchConfig, Config, ConflictResolution};
 use crate::datasource::DataSource;
 use crate::diff::{diff_table, TableDiff};
 use crate::error::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
-
-/// Default chunk size for upsert operations when transferring rows.
-const TRANSFER_CHUNK_SIZE: usize = 100;
 
 /// Result of a sync operation
 #[derive(Debug)]
@@ -50,12 +47,13 @@ fn progress_bar(total: u64, message: String) -> ProgressBar {
 /// Transfer rows from one DataSource to another.
 ///
 /// Fetches rows by primary key from `source`, then upserts into `dest`
-/// in chunks with progress display.
-async fn transfer_rows<S: DataSource, D: DataSource>(
-    source: &S,
-    dest: &D,
+/// in chunks (sized by `batch_config.batch_size`) with progress display.
+async fn transfer_rows<Src: DataSource, Dst: DataSource>(
+    source: &Src,
+    dest: &Dst,
     table: &str,
     pk_values: &[String],
+    batch_config: &BatchConfig,
     label: &str,
 ) -> Result<usize> {
     let rows = source.get_rows(table, pk_values).await?;
@@ -68,7 +66,7 @@ async fn transfer_rows<S: DataSource, D: DataSource>(
     let pb = progress_bar(rows.len() as u64, format!("{} {}", label, table));
     let mut total = 0;
 
-    for chunk in rows.chunks(TRANSFER_CHUNK_SIZE) {
+    for chunk in rows.chunks(batch_config.batch_size) {
         let count = dest.upsert_rows(table, chunk).await?;
         total += count;
         pb.inc(chunk.len() as u64);
@@ -79,12 +77,13 @@ async fn transfer_rows<S: DataSource, D: DataSource>(
 }
 
 /// Push changes from source to destination for a single table.
-pub async fn push_table<S: DataSource, D: DataSource>(
-    source: &S,
-    dest: &D,
+pub async fn push_table<Src: DataSource, Dst: DataSource>(
+    source: &Src,
+    dest: &Dst,
     table: &str,
     diff: &TableDiff,
     conflict_resolution: ConflictResolution,
+    batch_config: &BatchConfig,
     dry_run: bool,
 ) -> Result<SyncResult> {
     let mut result = SyncResult::new(table);
@@ -107,17 +106,19 @@ pub async fn push_table<S: DataSource, D: DataSource>(
         return Ok(result);
     }
 
-    result.rows_pushed = transfer_rows(source, dest, table, &rows_to_push, "Pushing").await?;
+    result.rows_pushed =
+        transfer_rows(source, dest, table, &rows_to_push, batch_config, "Pushing").await?;
     Ok(result)
 }
 
 /// Pull changes from source to destination for a single table.
-pub async fn pull_table<S: DataSource, D: DataSource>(
-    local: &D,
-    remote: &S,
+pub async fn pull_table<Src: DataSource, Dst: DataSource>(
+    local: &Dst,
+    remote: &Src,
     table: &str,
     diff: &TableDiff,
     conflict_resolution: ConflictResolution,
+    batch_config: &BatchConfig,
     dry_run: bool,
 ) -> Result<SyncResult> {
     let mut result = SyncResult::new(table);
@@ -140,7 +141,8 @@ pub async fn pull_table<S: DataSource, D: DataSource>(
         return Ok(result);
     }
 
-    result.rows_pulled = transfer_rows(remote, local, table, &rows_to_pull, "Pulling").await?;
+    result.rows_pulled =
+        transfer_rows(remote, local, table, &rows_to_pull, batch_config, "Pulling").await?;
     Ok(result)
 }
 
@@ -151,6 +153,7 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
     table: &str,
     timestamp_column: &str,
     conflict_resolution: ConflictResolution,
+    batch_config: &BatchConfig,
     dry_run: bool,
 ) -> Result<SyncResult> {
     let diff = diff_table(a, b, table, timestamp_column).await?;
@@ -160,8 +163,10 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
         return Ok(SyncResult::new(table));
     }
 
-    let push_result = push_table(a, b, table, &diff, conflict_resolution, dry_run).await?;
-    let pull_result = pull_table(a, b, table, &diff, conflict_resolution, dry_run).await?;
+    let push_result =
+        push_table(a, b, table, &diff, conflict_resolution, batch_config, dry_run).await?;
+    let pull_result =
+        pull_table(a, b, table, &diff, conflict_resolution, batch_config, dry_run).await?;
 
     Ok(SyncResult {
         table: table.to_string(),
@@ -222,9 +227,9 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
 }
 
 /// Push all tables from source to destination.
-pub async fn push_all<S: DataSource, D: DataSource>(
-    source: &S,
-    dest: &D,
+pub async fn push_all<Src: DataSource, Dst: DataSource>(
+    source: &Src,
+    dest: &Dst,
     config: &Config,
     tables: Option<Vec<String>>,
     dry_run: bool,
@@ -234,6 +239,7 @@ pub async fn push_all<S: DataSource, D: DataSource>(
         None => get_tables_to_sync(source, dest, config).await?,
     };
 
+    let batch_config = BatchConfig::from_sync_config(&config.sync);
     let mut results = Vec::new();
 
     for table in &tables_to_sync {
@@ -251,6 +257,7 @@ pub async fn push_all<S: DataSource, D: DataSource>(
             table,
             &diff,
             config.sync.conflict_resolution,
+            &batch_config,
             dry_run,
         )
         .await?;
@@ -261,9 +268,9 @@ pub async fn push_all<S: DataSource, D: DataSource>(
 }
 
 /// Pull all tables from source to destination.
-pub async fn pull_all<S: DataSource, D: DataSource>(
-    local: &D,
-    remote: &S,
+pub async fn pull_all<Src: DataSource, Dst: DataSource>(
+    local: &Dst,
+    remote: &Src,
     config: &Config,
     tables: Option<Vec<String>>,
     dry_run: bool,
@@ -273,6 +280,7 @@ pub async fn pull_all<S: DataSource, D: DataSource>(
         None => get_tables_to_sync(local, remote, config).await?,
     };
 
+    let batch_config = BatchConfig::from_sync_config(&config.sync);
     let mut results = Vec::new();
 
     for table in &tables_to_sync {
@@ -290,6 +298,7 @@ pub async fn pull_all<S: DataSource, D: DataSource>(
             table,
             &diff,
             config.sync.conflict_resolution,
+            &batch_config,
             dry_run,
         )
         .await?;
@@ -312,6 +321,7 @@ pub async fn sync_all<A: DataSource, B: DataSource>(
         None => get_tables_to_sync(a, b, config).await?,
     };
 
+    let batch_config = BatchConfig::from_sync_config(&config.sync);
     let mut results = Vec::new();
 
     for table in &tables_to_sync {
@@ -321,6 +331,7 @@ pub async fn sync_all<A: DataSource, B: DataSource>(
             table,
             &config.sync.timestamp_column,
             config.sync.conflict_resolution,
+            &batch_config,
             dry_run,
         )
         .await?;

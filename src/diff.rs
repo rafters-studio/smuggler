@@ -4,7 +4,7 @@ use crate::config::ConflictResolution;
 use crate::datasource::DataSource;
 use crate::error::Result;
 use std::collections::HashSet;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Represents the differences between local and remote for a table
 #[derive(Debug, Default)]
@@ -56,8 +56,14 @@ impl TableDiff {
                 // Don't push content_differs
             }
             ConflictResolution::NewerWins => {
-                // content_differs have no timestamp, so we skip them
-                // (or could use local as default)
+                if !self.content_differs.is_empty() {
+                    warn!(
+                        "{} row(s) in '{}' have different content but no usable timestamps -- \
+                         skipped under newer_wins. Use local_wins or remote_wins to resolve.",
+                        self.content_differs.len(),
+                        self.table
+                    );
+                }
             }
         }
 
@@ -78,7 +84,7 @@ impl TableDiff {
                 rows.extend(self.content_differs.clone());
             }
             ConflictResolution::NewerWins => {
-                // content_differs have no timestamp, so we skip them
+                // Warning already emitted in rows_to_push
             }
         }
 
