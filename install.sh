@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# install.sh: Installer for Smuggler (https://github.com/ezmode-games/smuggler)
+# install.sh: Installer for Smuggler (https://github.com/rafters-studio/smuggler)
 #
 # Usage:
-#   curl -fsSL https://ezmode.games/oss/smuggler/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/rafters-studio/smuggler/main/install.sh | bash
 #   curl -fsSL ... | bash -s v0.2.0
 #   SMUGGLER_VERSION=v0.2.0 bash install.sh
 
 set -euo pipefail
 
-REPO="ezmode-games/smuggler"
+REPO="rafters-studio/smuggler"
 INSTALL_DIR="${HOME}/.local/bin"
 BINARY_NAME="smuggler"
 

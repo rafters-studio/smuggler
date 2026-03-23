@@ -14,7 +14,7 @@ Running in production at [huttspawn.com](https://huttspawn.com) since early 2026
 
 Not 1.0 yet -- the API surface may still shift. But the core sync engine is solid and battle-tested, with S3-compatible relay sync for cross-machine workflows.
 
-There are [open issues](https://github.com/ezmode-games/smuggler/issues). We're shaving parsecs, not days.
+There are [open issues](https://github.com/rafters-studio/smuggler/issues). We're shaving parsecs, not days.
 
 ## What It Does
 
@@ -34,7 +34,7 @@ D1 is SQLite at the edge, but Cloudflare doesn't give you a way to sync your loc
 ### Quick install (recommended)
 
 ```bash
-curl -fsSL https://ezmode.games/oss/smuggler/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rafters-studio/smuggler/main/install.sh | bash
 ```
 
 Detects your platform, downloads the right binary, verifies the SHA256 checksum, and installs to `~/.local/bin/`. Supports Linux x64, macOS x64, and macOS ARM64. Detects Rosetta 2 and installs the native arm64 binary.
@@ -42,22 +42,22 @@ Detects your platform, downloads the right binary, verifies the SHA256 checksum,
 Install a specific version:
 
 ```bash
-curl -fsSL https://ezmode.games/oss/smuggler/install.sh | bash -s v0.1.2
+curl -fsSL https://raw.githubusercontent.com/rafters-studio/smuggler/main/install.sh | bash -s v0.1.2
 ```
 
 ### Manual download
 
 | Platform | Download |
 |----------|----------|
-| Linux x64 | [smuggler-linux-x64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-linux-x64.tar.gz) |
-| macOS x64 | [smuggler-macos-x64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-macos-x64.tar.gz) |
-| macOS ARM64 | [smuggler-macos-arm64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-macos-arm64.tar.gz) |
-| Windows x64 | [smuggler-windows-x64.zip](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-windows-x64.zip) |
+| Linux x64 | [smuggler-linux-x64.tar.gz](https://github.com/rafters-studio/smuggler/releases/latest/download/smuggler-linux-x64.tar.gz) |
+| macOS x64 | [smuggler-macos-x64.tar.gz](https://github.com/rafters-studio/smuggler/releases/latest/download/smuggler-macos-x64.tar.gz) |
+| macOS ARM64 | [smuggler-macos-arm64.tar.gz](https://github.com/rafters-studio/smuggler/releases/latest/download/smuggler-macos-arm64.tar.gz) |
+| Windows x64 | [smuggler-windows-x64.zip](https://github.com/rafters-studio/smuggler/releases/latest/download/smuggler-windows-x64.zip) |
 
 ### From source
 
 ```bash
-cargo install --git https://github.com/ezmode-games/smuggler
+cargo install --git https://github.com/rafters-studio/smuggler
 ```
 
 Requires Rust 1.75+.
@@ -201,7 +201,7 @@ Supported URL schemes:
 
 ### Usage with automation
 
-Stash/retrieve pairs well with session hooks. For example, with [Legion](https://github.com/ezmode-games/legion):
+Stash/retrieve pairs well with session hooks. For example, with [Legion](https://github.com/ssilvius/legion):
 
 ```bash
 # SessionStart hook
@@ -274,7 +274,7 @@ Things we don't do (yet):
 - **Full-sync transactions** - Each batch is atomic, but the whole sync isn't. Re-run if interrupted.
 - **BLOB wizardry** - Binary data compared as hex strings. It works but it's not pretty.
 - **Tables without primary keys** - We need something to compare. Add a PK.
-- **Linux ARM64** - Not available yet. See [issues](https://github.com/ezmode-games/smuggler/issues) for updates.
+- **Linux ARM64** - Not available yet. See [issues](https://github.com/rafters-studio/smuggler/issues) for updates.
 
 ## Troubleshooting
 
@@ -301,9 +301,7 @@ RUST_LOG=debug cargo run -- diff # Debug output
 
 ## Related Projects
 
-Part of the [ezmode-games](https://github.com/ezmode-games) toolchain, built for [huttspawn.com](https://huttspawn.com):
-
-- More tools coming when we get around to it
+Part of the [rafters-studio](https://github.com/rafters-studio) ecosystem. Built for [huttspawn.com](https://huttspawn.com) and the broader rafters portfolio.
 
 ## Contributing
 
