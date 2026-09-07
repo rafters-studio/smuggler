@@ -378,12 +378,14 @@ async fn get_sync_tables(
         .into_iter()
         .collect();
 
+    let considered = |t: &String| {
+        (sync_config.tables.is_empty() || sync_config.tables.contains(t))
+            && !sync_config.exclude_tables.iter().any(|ex| ex == t)
+    };
+
     let mut tables = Vec::new();
     for t in source_tables.intersection(&dest_tables) {
-        if !sync_config.tables.is_empty() && !sync_config.tables.contains(t) {
-            continue;
-        }
-        if sync_config.exclude_tables.iter().any(|ex| ex == t) {
+        if !considered(t) {
             continue;
         }
         let info = source
@@ -395,6 +397,18 @@ async fn get_sync_tables(
         }
     }
     tables.sort();
+
+    // Same rule as the native engine (#438): an empty intersection with
+    // tables on either side is a configuration error, not a silent no-op.
+    // The lists are each side's tables unfiltered, so the message describes
+    // the databases rather than the config's view of them.
+    let mut source_all: Vec<String> = source_tables.iter().cloned().collect();
+    let mut dest_all: Vec<String> = dest_tables.iter().cloned().collect();
+    source_all.sort();
+    dest_all.sort();
+    smugglr_core::sync::check_table_set(&sync_config.tables, &source_all, &dest_all, &tables)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
     Ok(tables)
 }
 
@@ -1186,6 +1200,20 @@ mod tests {
 
         assert!(entry.max_timestamp.is_none());
         assert_eq!(entry.hashes.len(), 1);
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn empty_intersection_is_a_config_error_in_the_wasm_client_too() {
+        // #438: the browser and Node paths apply the same rule as the CLI.
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let err =
+            smugglr_core::sync::check_table_set(&[], &s(&["orders"]), &s(&["unrelated"]), &[])
+                .expect_err("no shared table must be an error");
+        let msg = err.to_string();
+        assert!(msg.contains("Configuration error"), "{msg}");
+        assert!(msg.contains("Local tables: [\"orders\"]"), "{msg}");
+        assert!(msg.contains("Remote tables: [\"unrelated\"]"), "{msg}");
+        assert!(smugglr_core::sync::check_table_set(&[], &[], &[], &[]).is_ok());
     }
 
     // Was `#[test]`, which NEVER RAN: this crate is `#![cfg(target_arch =

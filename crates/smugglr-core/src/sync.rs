@@ -7,7 +7,7 @@
 use crate::config::{column_excluded, BatchConfig, Config, ConflictResolution, RetryConfig};
 use crate::datasource::DataSource;
 use crate::diff::{diff_table, DiffStats, TableDiff};
-use crate::error::Result;
+use crate::error::{Result, SyncError};
 
 /// Per-table primary key lists from the diff, for verbose dry-run output.
 #[derive(Debug, Clone)]
@@ -433,8 +433,76 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
         }
     }
 
+    // The message names what each side actually has, unfiltered, so an
+    // operator reading "Remote tables: [...]" sees the remote, not the
+    // remote after their own config was applied to it. Sorted so two runs
+    // print the same message.
+    let mut local_all: Vec<String> = local_tables.iter().cloned().collect();
+    let mut remote_all: Vec<String> = remote_tables.iter().cloned().collect();
+    local_all.sort();
+    remote_all.sort();
+    check_table_set(&config.sync.tables, &local_all, &remote_all, &syncable)?;
+
     info!("Found {} tables to sync", syncable.len());
     Ok(syncable)
+}
+
+/// Refuse a table set that would make a run report success while moving
+/// nothing (#438).
+///
+/// An empty intersection used to fall through to `status: ok` with an empty
+/// `tables` list and exit 0, which is what "already in sync" also looks like.
+/// Pointing smugglr at the wrong database, or at an unrelated server that
+/// answers 200, therefore looked like success. Three cases are errors, one is
+/// not:
+///
+/// 1. A configured `[sync].tables` entry that exists on neither side is a
+///    typo or a wrong target; name it.
+/// 2. Configured tables that all miss one side: name the config and both
+///    sides' tables.
+/// 3. No configured list, and no table shared by both sides, while at least
+///    one side has tables: name both sides.
+/// 4. Both sides have no tables at all: a warning and an empty set, because
+///    there is nothing the operator could have meant.
+///
+/// `local` and `remote` are every table each side reports, unfiltered, so the
+/// message describes the databases rather than the config's view of them.
+/// `syncable` is the resolved set (shared, passing the config, with a primary
+/// key). Pure, so the wasm client applies the same rule.
+pub fn check_table_set(
+    configured: &[String],
+    local: &[String],
+    remote: &[String],
+    syncable: &[String],
+) -> Result<()> {
+    let missing: Vec<&str> = configured
+        .iter()
+        .filter(|t| !local.contains(t) && !remote.contains(t))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(SyncError::Config(format!(
+            "configured table(s) {:?} exist on neither side. Local tables: {:?}. Remote tables: {:?}",
+            missing, local, remote
+        )));
+    }
+    if !syncable.is_empty() {
+        return Ok(());
+    }
+    if !configured.is_empty() {
+        return Err(SyncError::Config(format!(
+            "none of the configured tables {:?} exists on both sides with a primary key. Local tables: {:?}. Remote tables: {:?}",
+            configured, local, remote
+        )));
+    }
+    if !local.is_empty() || !remote.is_empty() {
+        return Err(SyncError::Config(format!(
+            "no table exists on both sides with a primary key, so nothing would sync. Local tables: {:?}. Remote tables: {:?}. Is the target the database you meant?",
+            local, remote
+        )));
+    }
+    warn!("both sides have no tables; nothing to sync");
+    Ok(())
 }
 
 /// Direction of a single-orientation, all-tables sync run.
@@ -621,6 +689,91 @@ pub async fn sync_all<A: DataSource, B: DataSource>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn a_configured_table_on_neither_side_is_named() {
+        let err = check_table_set(
+            &s(&["users", "postz"]),
+            &s(&["users"]),
+            &s(&["users"]),
+            &s(&["users"]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, SyncError::Config(_)), "{msg}");
+        assert!(msg.contains("[\"postz\"] exist on neither side"), "{msg}");
+    }
+
+    #[test]
+    fn configured_tables_that_miss_one_side_are_an_error() {
+        let err =
+            check_table_set(&s(&["orders"]), &s(&["orders"]), &s(&["customers"]), &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, SyncError::Config(_)), "{msg}");
+        assert!(msg.contains("none of the configured tables"), "{msg}");
+        assert!(msg.contains("Remote tables: [\"customers\"]"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_intersection_with_tables_on_a_side_is_an_error() {
+        let err = check_table_set(&[], &s(&["orders", "customers"]), &[], &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, SyncError::Config(_)), "{msg}");
+        assert!(
+            msg.contains("Is the target the database you meant?"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Local tables: [\"orders\", \"customers\"]"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn two_empty_databases_are_a_warned_no_op() {
+        assert!(check_table_set(&[], &[], &[], &[]).is_ok());
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn pointing_at_a_database_with_no_shared_table_is_a_config_error() {
+        use crate::local::LocalDb;
+        let dir = std::env::temp_dir().join(format!("smugglr-438-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let a = dir.join("a.db");
+        let b = dir.join("b.db");
+        for (path, ddl) in [
+            (&a, "CREATE TABLE orders (id TEXT PRIMARY KEY NOT NULL, updated_at INTEGER NOT NULL);"),
+            (&b, "CREATE TABLE unrelated (id TEXT PRIMARY KEY NOT NULL, updated_at INTEGER NOT NULL);"),
+        ] {
+            let conn = rusqlite::Connection::open(path).expect("open");
+            conn.execute_batch(ddl).expect("ddl");
+        }
+        let local = LocalDb::open(&a).expect("local");
+        let remote = LocalDb::open(&b).expect("remote");
+        let config: Config = toml::from_str(
+            "local_db = \"a.db\"\n[target]\ntype = \"sqlite\"\ndatabase = \"b.db\"\n",
+        )
+        .expect("minimal config");
+        let err = get_tables_to_sync(&local, &remote, &config)
+            .await
+            .expect_err("no shared table must be an error, not an empty list");
+        let msg = err.to_string();
+        assert!(matches!(err, SyncError::Config(_)), "{msg}");
+        assert!(msg.contains("\"orders\""), "{msg}");
+        assert!(msg.contains("\"unrelated\""), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shared_table_passes() {
+        assert!(check_table_set(&[], &s(&["a", "b"]), &s(&["b", "c"]), &s(&["b"])).is_ok());
+        assert!(check_table_set(&s(&["b"]), &s(&["a", "b"]), &s(&["b", "c"]), &s(&["b"])).is_ok());
+    }
 
     #[test]
     fn test_excluded_columns_stripped_from_rows() {
