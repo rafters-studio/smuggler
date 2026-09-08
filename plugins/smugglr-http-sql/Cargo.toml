@@ -28,7 +28,7 @@ hex = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
-# The #429 tests drive the documented `[target] type = "d1"` config through
-# smugglr-core's own resolve_target, so they parse the same TOML an operator
-# writes rather than constructing Config by hand.
+# The #429 tests parse the same `[target] type = "d1"` TOML an operator writes,
+# so the documented field names are exercised rather than a Config built by
+# hand with the right values already in it.
 toml = "0.8"

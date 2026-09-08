@@ -956,7 +956,7 @@ async fn run_status(
                 config: StatusConfig {
                     local_db: config.local_db_path().to_string(),
                     target_type: target_type.to_string(),
-                    target_url: target_url.clone(),
+                    target_url,
                     timestamp_column: config.sync.timestamp_column.clone(),
                     conflict_resolution: format!("{:?}", config.sync.conflict_resolution),
                     tables: config.sync.tables.clone(),
