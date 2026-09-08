@@ -26,6 +26,42 @@
 //! - `upsert_rows` - params: `{table, rows}`
 //! - `row_count` - params: `{table}`
 //!
+//! ## Error classes
+//!
+//! A JSON-RPC error response carries only `{code: i64, message: String}` --
+//! no structured params. A plugin signals *error class* (transient vs.
+//! permanent, and for permanent errors, which exit-code bucket) entirely
+//! through `code`, using one of a small set of codes reserved in the
+//! JSON-RPC "server error" range (`-32099..=-32000`):
+//!
+//! - `PLUGIN_TRANSIENT_ERROR_CODE` (-32010) -- general transient failure
+//!   (5xx, timeout). Retried; maps to `SyncError::ServerError { status: 503 }`.
+//! - `PLUGIN_RATE_LIMITED_ERROR_CODE` (-32011) -- rate limited (HTTP 429).
+//!   Retried; maps to `SyncError::RateLimited { retry_after }`.
+//! - `PLUGIN_CONFLICT_ERROR_CODE` (-32012) -- permanent conflict needing a
+//!   human decision (e.g. duplicate primary key). Not retried; maps to
+//!   `SyncError::PluginConflict`, exit code 4.
+//! - Any other code -- permanent, uncategorized. Not retried; maps to
+//!   `SyncError::Plugin`, exit code 1 (unchanged since #181).
+//!
+//! `message` is otherwise free text with exactly one documented exception:
+//! a `PLUGIN_RATE_LIMITED_ERROR_CODE` error may prefix `message` with
+//! `retry_after_ms=<millis>;` to carry a `Retry-After` delay (see
+//! `RETRY_AFTER_MS_PREFIX`, `parse_retry_after_ms`). That prefix is the only
+//! part of `message` this module parses. Nothing else in `message` is
+//! host-parsed, and it must never become so -- a richer error (structured
+//! typed fields, like `SyncError::DuplicatePrimaryKey`'s `table`/`pk`/
+//! `first_hash`/`second_hash`) cannot cross this wire without reconstructing
+//! it by parsing free text, which #333 named and rejected as an
+//! anti-pattern. A future error type that needs more than "which bucket" and
+//! "how long to wait" needs either a new reserved code (cheap, if the class
+//! is genuinely new) or a wire protocol change (structured error params),
+//! not a second string pattern bolted onto `message`.
+//!
+//! `LedgerTampered` and `SchemaDrift` (#290) are the next two `SyncError`
+//! variants that might need a plugin-side path; each gets its own reserved
+//! code here when that path exists, following this same shape.
+//!
 //! ## `upsert_rows`: what an absent column means
 //!
 //! A row object in `rows` is not required to carry every column the
@@ -91,33 +127,103 @@ struct RpcError {
     message: String,
 }
 
-/// JSON-RPC error code a plugin uses to signal a transient/retryable failure.
+/// JSON-RPC error code a plugin uses to signal a general transient/retryable
+/// failure (5xx, timeout).
 ///
 /// MUST match `smugglr_plugin_sdk::TRANSIENT_ERROR_CODE` -- it is the wire
 /// contract between a plugin (which constructs the error via
 /// `PluginError::transient`) and the host (which routes it here). Duplicated
 /// rather than shared because core does not depend on the SDK crate; a shared
-/// wire crate would unify the two (see #228).
+/// wire crate would unify the two (see #228). `smugglr_plugin_sdk`'s own
+/// `test_reserved_wire_codes_are_pinned` and this module's
+/// `plugin_error_codes_match_the_sdk` test pin the same literals on both
+/// sides, since nothing else enforces they stay in lockstep.
 const PLUGIN_TRANSIENT_ERROR_CODE: i64 = -32010;
 
-/// Map a plugin's JSON-RPC error onto a [`SyncError`].
+/// JSON-RPC error code a plugin uses to signal HTTP 429 specifically,
+/// distinct from [`PLUGIN_TRANSIENT_ERROR_CODE`] so a `Retry-After` delay has
+/// somewhere to travel: this maps to [`SyncError::RateLimited`] instead of
+/// the fixed `ServerError { status: 503 }` the general transient code
+/// produces.
 ///
-/// A plugin's backend can fail transiently (HTTP 429/5xx, timeout); the plugin
-/// signals that with [`PLUGIN_TRANSIENT_ERROR_CODE`]. Such errors map to a
-/// retryable `ServerError` so `upsert_with_retry` backs off and retries, instead
-/// of the hardwired-non-retryable `SyncError::Plugin`. All other codes stay
-/// `Plugin` (permanent).
+/// MUST match `smugglr_plugin_sdk::RATE_LIMITED_ERROR_CODE` -- see
+/// `PLUGIN_TRANSIENT_ERROR_CODE`'s doc for why this is duplicated rather than
+/// shared. Constructed plugin-side with `PluginError::rate_limited`.
+const PLUGIN_RATE_LIMITED_ERROR_CODE: i64 = -32011;
+
+/// JSON-RPC error code a plugin uses to signal a permanent conflict needing a
+/// human decision -- today, a duplicate-primary-key collision on the
+/// plugin's target (#269, #444). Maps to [`SyncError::PluginConflict`],
+/// sharing [`SyncError::DuplicatePrimaryKey`]'s exit code (4).
+///
+/// MUST match `smugglr_plugin_sdk::CONFLICT_ERROR_CODE` -- see
+/// `PLUGIN_TRANSIENT_ERROR_CODE`'s doc for why this is duplicated rather than
+/// shared. Constructed plugin-side with `PluginError::conflict`.
+const PLUGIN_CONFLICT_ERROR_CODE: i64 = -32012;
+
+/// The `message` prefix a plugin uses to carry a `Retry-After` delay, in
+/// milliseconds, across the wire on a [`PLUGIN_RATE_LIMITED_ERROR_CODE`]
+/// error: `"retry_after_ms=<millis>;<detail>"`.
+///
+/// MUST match `smugglr_plugin_sdk::RETRY_AFTER_MS_PREFIX`. Only this fixed
+/// prefix is parsed here -- the remainder of `message` is carried through
+/// unparsed as a human-readable detail folded into `SyncError::Plugin`'s
+/// message elsewhere, never matched on. Extending what crosses the wire means
+/// reserving a new code (or, if genuinely necessary, a new documented
+/// prefix), not adding a second string pattern to match on here -- the
+/// string-matching shape #333 rejected.
+const RETRY_AFTER_MS_PREFIX: &str = "retry_after_ms=";
+
+/// Parse a [`RETRY_AFTER_MS_PREFIX`]-prefixed message into the carried delay,
+/// in milliseconds. Returns `None` if the prefix is absent or the number
+/// before the first `;` fails to parse -- a malformed or missing prefix
+/// degrades to "no retry-after known" (the host falls back to its own
+/// backoff schedule), not a parse error, since the error's *class*
+/// (rate-limited) is already established by the wire code alone.
+fn parse_retry_after_ms(message: &str) -> Option<u64> {
+    message
+        .strip_prefix(RETRY_AFTER_MS_PREFIX)?
+        .split_once(';')?
+        .0
+        .parse::<u64>()
+        .ok()
+}
+
+/// Map a plugin's JSON-RPC error onto a [`SyncError`], by wire error class
+/// (see the module doc's "Error classes" section for what a plugin can and
+/// cannot communicate this way).
+///
+/// - [`PLUGIN_TRANSIENT_ERROR_CODE`] maps to a retryable `ServerError` so
+///   `upsert_with_retry` backs off and retries.
+/// - [`PLUGIN_RATE_LIMITED_ERROR_CODE`] maps to `RateLimited`, recovering any
+///   `Retry-After` delay the plugin carried in `message`.
+/// - [`PLUGIN_CONFLICT_ERROR_CODE`] maps to `PluginConflict`, sharing
+///   `DuplicatePrimaryKey`'s exit code (4).
+/// - Every other code stays `Plugin` (permanent, exit code 1) -- unchanged
+///   from before this module carried any error class at all, and pinned by
+///   `error.rs`'s `test_exit_code_plugin` regression test (#181).
 fn rpc_error_to_sync_error(plugin_name: &str, err: &RpcError) -> SyncError {
-    if err.code == PLUGIN_TRANSIENT_ERROR_CODE {
-        SyncError::ServerError {
+    match err.code {
+        PLUGIN_TRANSIENT_ERROR_CODE => SyncError::ServerError {
             status: 503,
             message: format!("plugin '{}': {}", plugin_name, err.message),
-        }
-    } else {
-        SyncError::Plugin(format!(
+        },
+        PLUGIN_RATE_LIMITED_ERROR_CODE => SyncError::RateLimited {
+            // The wire prefix is milliseconds; SyncError::RateLimited's
+            // retry_after (and retry_after_ms()'s *1000 back-conversion,
+            // error.rs:175-181) is seconds. Round up rather than down so a
+            // sub-second Retry-After never gets rounded away to an
+            // immediate retry.
+            retry_after: parse_retry_after_ms(&err.message).map(|ms| ms.div_ceil(1000)),
+        },
+        PLUGIN_CONFLICT_ERROR_CODE => SyncError::PluginConflict {
+            plugin: plugin_name.to_string(),
+            message: err.message.clone(),
+        },
+        _ => SyncError::Plugin(format!(
             "Plugin '{}' error (code {}): {}",
             plugin_name, err.code, err.message
-        ))
+        )),
     }
 }
 
@@ -485,6 +591,97 @@ mod tests {
         assert_eq!(meta.pk_value, "42");
         assert_eq!(meta.updated_at.unwrap(), "2026-04-03T12:00:00Z");
         assert_eq!(meta.content_hash, "abc123");
+    }
+
+    // Pin the literal wire codes against the SDK's own pinned literals
+    // (`smugglr_plugin_sdk::tests::test_reserved_wire_codes_are_pinned`).
+    // Core does not depend on the SDK crate, so nothing else enforces the
+    // two sides staying in lockstep -- if either literal moves, both tests
+    // must be updated deliberately.
+    #[test]
+    fn plugin_error_codes_match_the_sdk() {
+        assert_eq!(PLUGIN_TRANSIENT_ERROR_CODE, -32010);
+        assert_eq!(PLUGIN_RATE_LIMITED_ERROR_CODE, -32011);
+        assert_eq!(PLUGIN_CONFLICT_ERROR_CODE, -32012);
+        assert_eq!(RETRY_AFTER_MS_PREFIX, "retry_after_ms=");
+    }
+
+    #[test]
+    fn rate_limited_plugin_error_maps_to_retryable_with_retry_after() {
+        // #444: a 429 with a carried Retry-After must reach
+        // SyncError::RateLimited with the delay recovered (converted from
+        // the wire's milliseconds to RateLimited's seconds field), not the
+        // fixed ServerError{503} the general transient code produces.
+        let rate_limited = rpc_error_to_sync_error(
+            "http-sql",
+            &RpcError {
+                code: PLUGIN_RATE_LIMITED_ERROR_CODE,
+                message: "retry_after_ms=30000;429 from backend".into(),
+            },
+        );
+        assert!(rate_limited.is_retryable());
+        assert_eq!(rate_limited.exit_code(), 3);
+        match rate_limited {
+            SyncError::RateLimited { retry_after } => assert_eq!(retry_after, Some(30)),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limited_plugin_error_rounds_up_a_sub_second_retry_after() {
+        let rate_limited = rpc_error_to_sync_error(
+            "http-sql",
+            &RpcError {
+                code: PLUGIN_RATE_LIMITED_ERROR_CODE,
+                message: "retry_after_ms=500;429 from backend".into(),
+            },
+        );
+        match rate_limited {
+            SyncError::RateLimited { retry_after } => assert_eq!(retry_after, Some(1)),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limited_plugin_error_without_retry_after_still_retries() {
+        // No Retry-After on the response: still classified rate-limited and
+        // retryable, just without a recovered delay -- the host falls back
+        // to its own backoff schedule.
+        let rate_limited = rpc_error_to_sync_error(
+            "http-sql",
+            &RpcError {
+                code: PLUGIN_RATE_LIMITED_ERROR_CODE,
+                message: "429 from backend".into(),
+            },
+        );
+        assert!(rate_limited.is_retryable());
+        match rate_limited {
+            SyncError::RateLimited { retry_after } => assert_eq!(retry_after, None),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conflict_plugin_error_maps_to_exit_code_four() {
+        // #444, #269: a duplicate-PK collision on an http-sql target must
+        // exit 4, matching the native and direct paths, not collapse into
+        // the general/unknown bucket (exit 1) every other plugin error uses.
+        let conflict = rpc_error_to_sync_error(
+            "http-sql",
+            &RpcError {
+                code: PLUGIN_CONFLICT_ERROR_CODE,
+                message: "duplicate primary key '1' in table 'items'".into(),
+            },
+        );
+        assert!(!conflict.is_retryable());
+        assert_eq!(conflict.exit_code(), 4);
+        match conflict {
+            SyncError::PluginConflict { plugin, message } => {
+                assert_eq!(plugin, "http-sql");
+                assert_eq!(message, "duplicate primary key '1' in table 'items'");
+            }
+            other => panic!("expected PluginConflict, got {other:?}"),
+        }
     }
 
     #[test]

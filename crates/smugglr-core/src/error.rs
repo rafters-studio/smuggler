@@ -139,6 +139,24 @@ pub enum SyncError {
     /// catch; it needs a human decision, so it shares the conflict exit code (4).
     #[error("Migration ledger tamper detected: {0}")]
     LedgerTampered(String),
+
+    /// A plugin-side permanent conflict needing a human decision -- today
+    /// this is exactly the duplicate-primary-key collision `adapter.rs`'s
+    /// `get_row_metadata` refuses on an http-sql target, the plugin-side
+    /// counterpart to [`SyncError::DuplicatePrimaryKey`] (#269, #444).
+    ///
+    /// The JSON-RPC wire carries only `{code, message}` -- not
+    /// `DuplicatePrimaryKey`'s four typed fields (`table`, `pk`,
+    /// `first_hash`, `second_hash`), which cannot be reconstructed from a
+    /// `{code, message}` pair without parsing the message string, the exact
+    /// string-matching anti-pattern #333 rejected. So this variant carries
+    /// only what the wire can actually carry: which plugin, and its message.
+    /// Shares `DuplicatePrimaryKey`'s exit code (4) in `exit_code()` -- both
+    /// are "a human must reconcile data before this sync can proceed" -- but
+    /// is a distinct variant, so `DuplicatePrimaryKey`'s existing mapping and
+    /// the #181 regression test pinning `Plugin` to exit 1 are untouched.
+    #[error("Plugin '{plugin}' reported a conflict: {message}")]
+    PluginConflict { plugin: String, message: String },
 }
 
 impl SyncError {
@@ -213,7 +231,12 @@ impl SyncError {
             // cannot pick a winner without discarding a row -- so it shares the
             // conflict bucket (4) rather than reading as a config error. The
             // remedy is to re-key the rows, not to edit smugglr.toml.
-            SyncError::DuplicatePrimaryKey { .. } => 4,
+            //
+            // PluginConflict is the same remedy class arriving over the
+            // plugin wire (#444) -- an explicit arm because exit_code() has a
+            // `_ => 1` arm below: without it the variant would silently read
+            // as general/unknown instead of conflict.
+            SyncError::DuplicatePrimaryKey { .. } | SyncError::PluginConflict { .. } => 4,
 
             SyncError::TableNotFound(_)
             | SyncError::RelayNotFound(_)
@@ -425,6 +448,24 @@ mod tests {
         // Re-running collides again on the same two rows, so retrying is never
         // productive. `is_retryable` has a `_ => false` arm; pin the verdict so a
         // future refactor cannot flip it into the retry loop.
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_exit_code_plugin_conflict() {
+        // #444: a plugin-side duplicate-PK collision needs the same human
+        // decision as the native path's DuplicatePrimaryKey, so it shares
+        // exit code 4 -- pinned because exit_code() has a `_ => 1` arm:
+        // without an explicit case the variant would silently read as
+        // general/unknown.
+        let err = SyncError::PluginConflict {
+            plugin: "http-sql".into(),
+            message: "duplicate primary key '1' in table 'items'".into(),
+        };
+        assert_eq!(err.exit_code(), 4);
+        // Re-running collides again on the same two rows, so retrying is
+        // never productive -- pin the verdict so a future refactor cannot
+        // flip it into the retry loop.
         assert!(!err.is_retryable());
     }
 

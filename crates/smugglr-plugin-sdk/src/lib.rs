@@ -45,9 +45,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 /// importing these from `smugglr_plugin_sdk` as before.
 pub use smugglr_wire::{ColumnInfo, RowMeta, TableInfo};
 
+/// The default JSON-RPC error code for an unclassified plugin error --
+/// permanent, general failure (exit code 1's bucket). What [`PluginError::new`]
+/// uses when a plugin does not classify its error further.
+pub const DEFAULT_ERROR_CODE: i64 = -32000;
+
 /// Well-known JSON-RPC error code that a plugin uses to signal a *transient*
-/// failure (rate limit, 5xx, timeout against a remote backend) that smugglr
-/// should treat as retryable, mirroring the native `is_retryable` retry path.
+/// failure (5xx, timeout against a remote backend) that smugglr should treat
+/// as retryable, mirroring the native `is_retryable` retry path.
 ///
 /// Codes are conveyed on the wire in the JSON-RPC `error.code` field. The host
 /// honors this specific code by routing the error onto the retry/backoff path
@@ -56,8 +61,98 @@ pub use smugglr_wire::{ColumnInfo, RowMeta, TableInfo};
 ///
 /// This sits in the JSON-RPC "server error" reserved range (-32099..=-32000)
 /// and is distinct from the default plugin error code (-32000) so the host can
-/// distinguish "retry me" from "this is fatal".
+/// distinguish "retry me" from "this is fatal". See [`PluginErrorClass`] for
+/// the full set of reserved codes and how they extend.
 pub const TRANSIENT_ERROR_CODE: i64 = -32010;
+
+/// Well-known JSON-RPC error code that a plugin uses to signal HTTP 429
+/// specifically, distinct from [`TRANSIENT_ERROR_CODE`] so the host can
+/// recover a `Retry-After` delay and map the error to
+/// `SyncError::RateLimited { retry_after }` instead of the generic
+/// `ServerError { status: 503 }` the plain transient code produces.
+///
+/// The wire carries only `{code, message}` -- no structured params -- so the
+/// delay crosses as a documented prefix on `message`, built by
+/// [`PluginError::rate_limited`]: see [`RETRY_AFTER_MS_PREFIX`].
+pub const RATE_LIMITED_ERROR_CODE: i64 = -32011;
+
+/// Well-known JSON-RPC error code that a plugin uses to signal a *permanent*
+/// conflict needing a human decision -- e.g. a duplicate-primary-key
+/// collision on the plugin's target, the same condition
+/// `SyncError::DuplicatePrimaryKey` refuses on the native path. Maps to a
+/// host-side error sharing `DuplicatePrimaryKey`'s exit code (4). Construct
+/// with [`PluginError::conflict`].
+pub const CONFLICT_ERROR_CODE: i64 = -32012;
+
+/// The `message` prefix a plugin uses to carry a `Retry-After` delay, in
+/// milliseconds, across the wire on a [`RATE_LIMITED_ERROR_CODE`] error:
+/// `"retry_after_ms=<millis>;<detail>"`. The host parses ONLY this fixed
+/// prefix -- never the remainder of `message` -- so this stays the one
+/// documented exception to "the wire carries no structured error detail
+/// beyond `code`", not a precedent for string-matching arbitrary error text
+/// (the shape #333 rejected). [`PluginError::rate_limited`] builds it;
+/// nothing parses it on the plugin side.
+pub const RETRY_AFTER_MS_PREFIX: &str = "retry_after_ms=";
+
+/// A small, closed set of wire-level error classes a plugin can signal to the
+/// host via the JSON-RPC `error.code` field.
+///
+/// Each variant maps to exactly one of the documented 0-5 exit-code buckets
+/// (see `smugglr_core::error::SyncError::exit_code`). Extending the protocol
+/// with a new class means adding a variant (and a newly reserved code) here,
+/// never repurposing an existing one or falling back to string-matching
+/// `message` -- the wire's only other structured channel is the one
+/// documented `retry_after_ms=` prefix above.
+///
+/// Core does not depend on this crate (see `PLUGIN_TRANSIENT_ERROR_CODE`'s
+/// doc in `smugglr_core::plugin` for why), so the host-side mapping in
+/// `smugglr_core::plugin::rpc_error_to_sync_error` duplicates these codes as
+/// plain constants rather than sharing this enum. Keep the two in lockstep.
+///
+/// ## What's next
+///
+/// `LedgerTampered` and `SchemaDrift` (#290) are the next two exit-code
+/// buckets a plugin might need to signal over this wire. Each gets its own
+/// variant and reserved code here when a plugin-side path for it exists --
+/// `Conflict` is duplicate-PK's bucket specifically, not a general-purpose
+/// "needs a human" catch-all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginErrorClass {
+    /// Permanent, uncategorized -- exit code 1's bucket. The default.
+    Other,
+    /// Transient, general (5xx, timeout) -- host retries, mapping to
+    /// `ServerError { status: 503 }`.
+    Transient,
+    /// Transient, rate limited (HTTP 429) -- host retries, mapping to
+    /// `RateLimited { retry_after }`.
+    RateLimited,
+    /// Permanent, conflict -- needs a human decision. Exit code 4's bucket.
+    Conflict,
+}
+
+impl PluginErrorClass {
+    /// The JSON-RPC `error.code` this class is signaled with on the wire.
+    pub const fn code(self) -> i64 {
+        match self {
+            PluginErrorClass::Other => DEFAULT_ERROR_CODE,
+            PluginErrorClass::Transient => TRANSIENT_ERROR_CODE,
+            PluginErrorClass::RateLimited => RATE_LIMITED_ERROR_CODE,
+            PluginErrorClass::Conflict => CONFLICT_ERROR_CODE,
+        }
+    }
+
+    /// Recover the class a wire code was constructed with. Any code not in
+    /// the reserved set (including the SDK's own `-32601`/`-32602` protocol
+    /// errors) reads as [`PluginErrorClass::Other`].
+    pub const fn from_code(code: i64) -> Self {
+        match code {
+            TRANSIENT_ERROR_CODE => PluginErrorClass::Transient,
+            RATE_LIMITED_ERROR_CODE => PluginErrorClass::RateLimited,
+            CONFLICT_ERROR_CODE => PluginErrorClass::Conflict,
+            _ => PluginErrorClass::Other,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct PluginError {
@@ -69,7 +164,7 @@ impl PluginError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            code: -32000,
+            code: DEFAULT_ERROR_CODE,
         }
     }
 
@@ -83,15 +178,50 @@ impl PluginError {
     /// Construct an error the host should treat as transient and retry.
     ///
     /// Use this when the underlying backend reports a recoverable failure
-    /// (HTTP 429/5xx, connection timeout, etc.). The error carries
+    /// (HTTP 5xx, connection timeout, etc.) that is not specifically a rate
+    /// limit -- use [`PluginError::rate_limited`] for HTTP 429, so a
+    /// `Retry-After` delay has somewhere to travel. The error carries
     /// [`TRANSIENT_ERROR_CODE`] on the JSON-RPC wire.
     pub fn transient(message: impl Into<String>) -> Self {
-        Self::with_code(message, TRANSIENT_ERROR_CODE)
+        Self::with_code(message, PluginErrorClass::Transient.code())
     }
 
-    /// Whether this error is tagged as transient/retryable via its code.
+    /// Construct a rate-limited error (HTTP 429). `retry_after_ms`, when
+    /// known (e.g. read from a `Retry-After` response header), crosses the
+    /// wire as a [`RETRY_AFTER_MS_PREFIX`]-prefixed `message`; `detail` is the
+    /// human-readable remainder. The host retries this like
+    /// [`PluginError::transient`] but recovers the delay instead of always
+    /// falling back to a fixed backoff.
+    pub fn rate_limited(retry_after_ms: Option<u64>, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        let message = match retry_after_ms {
+            Some(ms) => format!("{RETRY_AFTER_MS_PREFIX}{ms};{detail}"),
+            None => detail,
+        };
+        Self::with_code(message, PluginErrorClass::RateLimited.code())
+    }
+
+    /// Construct a permanent conflict error (e.g. a duplicate-primary-key
+    /// collision) that needs a human decision, not a retry. The error carries
+    /// [`CONFLICT_ERROR_CODE`] on the JSON-RPC wire and maps host-side to the
+    /// same exit code (4) as `SyncError::DuplicatePrimaryKey`.
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::with_code(message, PluginErrorClass::Conflict.code())
+    }
+
+    /// The wire-level class this error's code was constructed with.
+    pub fn class(&self) -> PluginErrorClass {
+        PluginErrorClass::from_code(self.code)
+    }
+
+    /// Whether this error is tagged as transient/retryable via its code --
+    /// true for both [`PluginError::transient`] and
+    /// [`PluginError::rate_limited`].
     pub fn is_transient(&self) -> bool {
-        self.code == TRANSIENT_ERROR_CODE
+        matches!(
+            self.class(),
+            PluginErrorClass::Transient | PluginErrorClass::RateLimited
+        )
     }
 }
 
@@ -502,6 +632,72 @@ mod tests {
         let resp = RpcResponse::err(1, err.code, err.message);
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(&TRANSIENT_ERROR_CODE.to_string()));
+    }
+
+    // Regression for #444: HTTP 429 needs its own wire code, distinct from the
+    // general transient code, so a Retry-After delay has somewhere to travel.
+    #[test]
+    fn test_rate_limited_error_code() {
+        let err = PluginError::rate_limited(Some(30_000), "429 from backend");
+        assert_eq!(err.code, RATE_LIMITED_ERROR_CODE);
+        assert!(err.is_transient());
+        assert_eq!(err.class(), PluginErrorClass::RateLimited);
+        assert_eq!(err.message, "retry_after_ms=30000;429 from backend");
+    }
+
+    #[test]
+    fn test_rate_limited_error_without_retry_after() {
+        // No Retry-After header on the response: still rate-limited/transient,
+        // just without the prefix -- the host falls back to its own backoff.
+        let err = PluginError::rate_limited(None, "429 from backend");
+        assert_eq!(err.code, RATE_LIMITED_ERROR_CODE);
+        assert!(err.is_transient());
+        assert_eq!(err.message, "429 from backend");
+        assert!(!err.message.starts_with(RETRY_AFTER_MS_PREFIX));
+    }
+
+    #[test]
+    fn test_conflict_error_code() {
+        let err = PluginError::conflict("duplicate primary key '1' in table 'items'");
+        assert_eq!(err.code, CONFLICT_ERROR_CODE);
+        assert!(!err.is_transient(), "a conflict needs a human, not a retry");
+        assert_eq!(err.class(), PluginErrorClass::Conflict);
+    }
+
+    #[test]
+    fn test_plugin_error_class_default_is_other() {
+        assert_eq!(PluginError::new("oops").class(), PluginErrorClass::Other);
+        // A protocol-level code (unknown method, bad param) is not one of the
+        // reserved classes either -- it reads as Other, same as any other
+        // code outside the reserved set.
+        assert_eq!(PluginErrorClass::from_code(-32601), PluginErrorClass::Other);
+    }
+
+    #[test]
+    fn test_plugin_error_class_code_roundtrips() {
+        for class in [
+            PluginErrorClass::Other,
+            PluginErrorClass::Transient,
+            PluginErrorClass::RateLimited,
+            PluginErrorClass::Conflict,
+        ] {
+            assert_eq!(PluginErrorClass::from_code(class.code()), class);
+        }
+    }
+
+    // Pin the literal wire codes: `smugglr_core::plugin` duplicates these as
+    // its own constants (core does not depend on this crate) rather than
+    // sharing this enum, so nothing enforces the two staying in lockstep
+    // except both sides asserting on the same literals. If either literal
+    // moves, this test and its counterpart in `smugglr_core::plugin` must
+    // both be updated deliberately.
+    #[test]
+    fn test_reserved_wire_codes_are_pinned() {
+        assert_eq!(TRANSIENT_ERROR_CODE, -32010);
+        assert_eq!(RATE_LIMITED_ERROR_CODE, -32011);
+        assert_eq!(CONFLICT_ERROR_CODE, -32012);
+        assert_eq!(DEFAULT_ERROR_CODE, -32000);
+        assert_eq!(RETRY_AFTER_MS_PREFIX, "retry_after_ms=");
     }
 
     #[test]

@@ -9,6 +9,32 @@ use smugglr_plugin_sdk::{ColumnInfo, PluginAdapter, PluginError, RowMeta, TableI
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Classify a non-2xx HTTP response into the wire error class the host
+/// should treat it as (#444):
+///
+/// - 429 is rate-limited -- retryable, carrying any `Retry-After` value so
+///   the host recovers a real delay instead of falling back to its own
+///   backoff schedule.
+/// - Other 5xx is general-transient -- retryable, no delay to carry.
+/// - Everything else (4xx other than 429) is permanent -- retrying it would
+///   never succeed.
+///
+/// A free function, not a method, so it is unit-testable without a live HTTP
+/// round trip.
+fn classify_http_error(
+    status: reqwest::StatusCode,
+    retry_after_ms: Option<u64>,
+    detail: String,
+) -> PluginError {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        PluginError::rate_limited(retry_after_ms, detail)
+    } else if status.is_server_error() {
+        PluginError::transient(detail)
+    } else {
+        PluginError::new(detail)
+    }
+}
+
 pub struct HttpSqlAdapter {
     client: Option<Client>,
     url: String,
@@ -60,18 +86,33 @@ impl HttpSqlAdapter {
             _ => req,
         };
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| PluginError::new(format!("HTTP request failed: {}", e)))?;
+        let resp = req.send().await.map_err(|e| {
+            // A timeout or failed connect against a hosted backend is the
+            // same "try again later" condition a 5xx is -- classify it
+            // transient so upsert_with_retry backs off instead of failing
+            // fast on what may be a momentary network blip (#444).
+            if e.is_timeout() || e.is_connect() {
+                PluginError::transient(format!("HTTP request failed: {}", e))
+            } else {
+                PluginError::new(format!("HTTP request failed: {}", e))
+            }
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
+            // Read Retry-After before consuming `resp` for the body -- a
+            // malformed or absent header degrades to "no retry-after known",
+            // not a parse failure, since the classification below still
+            // stands on the status code alone.
+            let retry_after_ms = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|secs| secs.saturating_mul(1000));
             let body = resp.text().await.unwrap_or_default();
-            return Err(PluginError::new(format!(
-                "HTTP {} from {}: {}",
-                status, self.url, body
-            )));
+            let detail = format!("HTTP {} from {}: {}", status, self.url, body);
+            return Err(classify_http_error(status, retry_after_ms, detail));
         }
 
         resp.json::<Value>()
@@ -241,7 +282,7 @@ impl PluginAdapter for HttpSqlAdapter {
             table,
             DuplicatePkPolicy::default(),
         )
-        .map_err(|e| PluginError::new(e.to_string()))
+        .map_err(classify_row_metadata_error)
     }
 
     async fn get_rows(
@@ -281,14 +322,9 @@ impl PluginAdapter for HttpSqlAdapter {
         for batch in rows.chunks(batch_size) {
             let (sql, params) = smugglr_core::batch_sql::generate_batch_sql(table, &columns, batch);
 
-            self.execute(&sql, &params).await.map_err(|e| {
-                PluginError::new(format!(
-                    "batch upsert failed for table '{}' ({} rows in batch): {}",
-                    table,
-                    batch.len(),
-                    e
-                ))
-            })?;
+            self.execute(&sql, &params)
+                .await
+                .map_err(|e| batch_context(e, table, batch.len()))?;
             total += batch.len();
         }
 
@@ -355,6 +391,39 @@ fn canonicalize_row_blobs(maps: &mut [HashMap<String, Value>], info: &TableInfo)
     }
 }
 
+/// Add batch context (which table, how many rows) to an `execute()` failure
+/// without disturbing its wire error class (#444). Only the default
+/// (permanent, uncategorized) code gets the extra detail prefixed onto
+/// `message` -- a classified error's code, and for a rate-limited error its
+/// leading `retry_after_ms=` prefix, must survive unchanged all the way to
+/// the host. Prefixing batch context in front of that marker would both hide
+/// it from the host's parser and silently downgrade a retryable 429/5xx into
+/// a permanent failure the moment a batch upsert hit one.
+fn batch_context(err: PluginError, table: &str, batch_len: usize) -> PluginError {
+    if err.code != smugglr_plugin_sdk::DEFAULT_ERROR_CODE {
+        return err;
+    }
+    PluginError::new(format!(
+        "batch upsert failed for table '{}' ({} rows in batch): {}",
+        table, batch_len, err.message
+    ))
+}
+
+/// Map a `build_row_metadata` failure onto the wire error the plugin sends
+/// back. A duplicate-PK collision (#269, #444) is a permanent conflict that
+/// needs a human decision, the same remedy class as the native path's
+/// `SyncError::DuplicatePrimaryKey`, so it is tagged with the conflict wire
+/// code instead of the default. Every other `build_row_metadata` failure
+/// (currently none besides the duplicate-PK refusal, but this stays open for
+/// whatever `DuplicatePkPolicy::check` grows) keeps the default permanent
+/// code, unchanged from before.
+fn classify_row_metadata_error(err: SyncError) -> PluginError {
+    match err {
+        SyncError::DuplicatePrimaryKey { .. } => PluginError::conflict(err.to_string()),
+        other => PluginError::new(other.to_string()),
+    }
+}
+
 fn build_row_metadata(
     maps: &[HashMap<String, Value>],
     column_order: &[String],
@@ -409,6 +478,138 @@ fn build_row_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #444: before the fix, every non-2xx status (429 and 5xx included) went
+    /// through `PluginError::new`, the default (permanent, non-retryable)
+    /// code. A 429/5xx from a hosted backend must instead classify as
+    /// retryable so `upsert_with_retry` backs off instead of failing fast --
+    /// this drives it through `upsert_rows`, the actual sync-write path, not
+    /// just `execute()` directly, since batch-context wrapping is exactly
+    /// where a classified error can get silently downgraded back to
+    /// permanent.
+    #[tokio::test]
+    async fn upsert_rows_classifies_503_as_transient() {
+        let (endpoint, _server) = capture_error_response(503, "Service Unavailable", None).await;
+        let mut adapter = HttpSqlAdapter::new();
+        let mut config = HashMap::new();
+        config.insert("url".to_string(), endpoint);
+        // initialize()'s own SELECT 1 would consume the one queued response;
+        // point it at a client with no connection test by constructing the
+        // adapter fields directly instead of calling initialize().
+        adapter.client = Some(reqwest::Client::new());
+        adapter.url = config.get("url").unwrap().clone();
+
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), Value::from(1));
+        let err = adapter
+            .upsert_rows("items", &[row])
+            .await
+            .expect_err("a 503 must surface as an error");
+
+        assert_eq!(
+            err.code,
+            smugglr_plugin_sdk::TRANSIENT_ERROR_CODE,
+            "a 5xx must be tagged transient so the host retries it, not code {} (message: {})",
+            err.code,
+            err.message
+        );
+    }
+
+    /// #444: HTTP 429 must classify as rate-limited (not the general
+    /// transient code) and carry any `Retry-After` header value across the
+    /// wire, so the host can recover it into `SyncError::RateLimited {
+    /// retry_after }` instead of a fixed 503-shaped backoff.
+    #[tokio::test]
+    async fn upsert_rows_classifies_429_as_rate_limited_with_retry_after() {
+        let (endpoint, _server) =
+            capture_error_response(429, "Too Many Requests", Some("30")).await;
+        let mut adapter = HttpSqlAdapter::new();
+        adapter.client = Some(reqwest::Client::new());
+        adapter.url = endpoint;
+
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), Value::from(1));
+        let err = adapter
+            .upsert_rows("items", &[row])
+            .await
+            .expect_err("a 429 must surface as an error");
+
+        assert_eq!(
+            err.code,
+            smugglr_plugin_sdk::RATE_LIMITED_ERROR_CODE,
+            "a 429 must be tagged rate-limited, not code {} (message: {})",
+            err.code,
+            err.message
+        );
+        assert!(
+            err.message.starts_with("retry_after_ms=30000;"),
+            "the Retry-After: 30 header must cross as a retry_after_ms= prefix, got: {}",
+            err.message
+        );
+    }
+
+    /// A 429 with no `Retry-After` header still classifies as rate-limited --
+    /// the host just falls back to its own backoff schedule.
+    #[tokio::test]
+    async fn upsert_rows_classifies_429_without_retry_after_header() {
+        let (endpoint, _server) = capture_error_response(429, "Too Many Requests", None).await;
+        let mut adapter = HttpSqlAdapter::new();
+        adapter.client = Some(reqwest::Client::new());
+        adapter.url = endpoint;
+
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), Value::from(1));
+        let err = adapter
+            .upsert_rows("items", &[row])
+            .await
+            .expect_err("a 429 must surface as an error");
+
+        assert_eq!(err.code, smugglr_plugin_sdk::RATE_LIMITED_ERROR_CODE);
+        assert!(!err.message.starts_with("retry_after_ms="));
+    }
+
+    /// A 4xx that is not 429 (a bad request, say) stays permanent -- retrying
+    /// it would never succeed, so it must not pick up a transient/rate-limited
+    /// code.
+    #[tokio::test]
+    async fn upsert_rows_keeps_other_4xx_permanent() {
+        let (endpoint, _server) = capture_error_response(400, "Bad Request", None).await;
+        let mut adapter = HttpSqlAdapter::new();
+        adapter.client = Some(reqwest::Client::new());
+        adapter.url = endpoint;
+
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), Value::from(1));
+        let err = adapter
+            .upsert_rows("items", &[row])
+            .await
+            .expect_err("a 400 must surface as an error");
+
+        assert_eq!(err.code, smugglr_plugin_sdk::DEFAULT_ERROR_CODE);
+    }
+
+    /// #444: `get_row_metadata`'s duplicate-PK refusal must reach the host as
+    /// the new conflict wire code, not the default permanent code -- so it
+    /// maps to a distinct exit-code bucket instead of collapsing into the
+    /// same "general/unknown" bucket as any other plugin failure.
+    #[test]
+    fn duplicate_pk_error_maps_to_conflict_code() {
+        let err = SyncError::DuplicatePrimaryKey {
+            table: "items".into(),
+            pk: "1".into(),
+            first_hash: "aaaa".into(),
+            second_hash: "bbbb".into(),
+        };
+        let mapped = classify_row_metadata_error(err);
+        assert_eq!(mapped.code, smugglr_plugin_sdk::CONFLICT_ERROR_CODE);
+    }
+
+    #[test]
+    fn other_row_metadata_errors_stay_permanent() {
+        let err = SyncError::Config("bad config".into());
+        let mapped = classify_row_metadata_error(err);
+        assert_eq!(mapped.code, smugglr_plugin_sdk::DEFAULT_ERROR_CODE);
+    }
 
     #[test]
     fn build_row_metadata_skips_null_primary_key() {
@@ -806,6 +1007,70 @@ async fn capture_one_request(
             host,
             authorization,
         }
+    });
+
+    (format!("http://{}", addr), handle)
+}
+
+/// Stand up a one-shot HTTP endpoint that answers a single request with a
+/// non-2xx status, optionally carrying a `Retry-After` header, and hand back
+/// the URL. For the HTTP-error-classification tests (#444) -- `execute()`
+/// takes the non-success branch before ever touching the response body, so
+/// unlike [`capture_one_request`] the body here is fixed and only the status
+/// line and headers vary per test.
+#[cfg(test)]
+async fn capture_error_response(
+    status: u16,
+    reason: &'static str,
+    retry_after: Option<&'static str>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("read back the bound port");
+
+    let handle = tokio::spawn(async move {
+        let deadline = std::time::Duration::from_secs(10);
+        let (mut socket, _) = tokio::time::timeout(deadline, listener.accept())
+            .await
+            .expect("the adapter must connect within the deadline")
+            .expect("accept the adapter");
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = tokio::time::timeout(deadline, socket.read(&mut chunk))
+                .await
+                .expect("the adapter must finish its header block within the deadline")
+                .expect("read the request");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let retry_after_header = retry_after
+            .map(|v| format!("Retry-After: {}\r\n", v))
+            .unwrap_or_default();
+        let body = "{}";
+        let response = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\n\r\n{}",
+            status,
+            reason,
+            retry_after_header,
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("answer the adapter");
+        socket.flush().await.expect("flush the response");
     });
 
     (format!("http://{}", addr), handle)
