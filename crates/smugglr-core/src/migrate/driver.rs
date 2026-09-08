@@ -14,6 +14,8 @@
 //! ```text
 //! verify checksum
 //!   -> ensure ledger schema
+//!   -> [already applied? -> AlreadyApplied, no further checks]
+//!   -> refuse a rowid-alias / AUTOINCREMENT key (#427)
 //!   -> version = current_version + 1        (the DRIVER assigns it)
 //!   -> [optional reconcile preflight -- #290]
 //!   -> ledger.try_elect(version, checksum)
