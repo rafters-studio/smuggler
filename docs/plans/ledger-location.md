@@ -81,8 +81,14 @@ ledger writes to.
 - **The ledger describes migrations, not targets.** One chain: version,
   checksum, ops, and the schema fingerprint that version produces. No row is
   keyed to a target, because nothing may scale with the number of targets.
-- `config.rs` loses the `_smugglr_migrations` entry from the default
-  `exclude_tables`. Nothing writes that table any more.
+- `config.rs` **keeps** the `_smugglr_migrations` entry in the default
+  `exclude_tables`. An earlier draft of this document said to drop it, on the
+  reasoning that nothing writes the table any more. That is wrong and the
+  correction came from #456's author: every already-migrated database still
+  *carries* the table after relocation ships. Dropping the exclusion would make
+  sync start replicating that stale leftover to every target -- pushing smugglr's
+  old bookkeeping into the databases this whole change exists to keep it out of.
+  The entry stops being a tell and becomes a tombstone.
 - `docs/examples/cli-migrate/README.md` documents the ledger as living inside the
   migrated database. It stops being true.
 
@@ -131,7 +137,7 @@ terms.
 
 - **The ledger is written against rusqlite, not against an abstraction. This is
   the barrier to a remote connection string, and it is bigger than an error
-  code.** Fifteen functions in `ledger.rs` take `&rusqlite::Connection`
+  code.** *(Now filed as #457; #456 is the relocation.)* Fourteen production functions in `ledger.rs` take `&rusqlite::Connection`
   (`try_elect`, `mark_success`, `current_version`, `verify_chain`, the rest), and
   the module is `#![cfg(feature = "native")]`. D1 is arguably the most widely used
   SQLite, so "the ledger lives in a D1" is a mainstream configuration, not an
