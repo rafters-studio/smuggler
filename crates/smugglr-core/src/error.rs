@@ -159,6 +159,62 @@ pub enum SyncError {
     PluginConflict { plugin: String, message: String },
 }
 
+/// How an HTTP status from a remote target should be treated on retry (#444).
+///
+/// Shared because it was not, and that cost a shipped defect. The http-sql
+/// plugin classified 429 and 5xx while the wasm fetch adapter mapped every
+/// non-2xx to a non-retryable error, so a browser client got one attempt at a
+/// 503 where the CLI backed off -- the same divergence that produced #436, in
+/// the same pair of files. Each adapter still renders its own error type; only
+/// the judgement is shared, because the judgement is what must not differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpRetryClass {
+    /// 429. Back off, honouring `Retry-After` when the response carries one.
+    RateLimited,
+    /// 5xx. Back off on the configured schedule.
+    Transient,
+    /// Everything else, 4xx included. Retrying will not help.
+    Permanent,
+}
+
+/// Classify a remote target's HTTP status for retry.
+///
+/// `Transient` is bounded to 5xx rather than `>= 500`. `reqwest`'s
+/// `is_server_error()`, which the plugin adapter used before this was shared, is
+/// `(500..600)`, and widening it here would have silently turned a 600-999
+/// status from permanent into retryable on that path -- a behavior change review
+/// caught me claiming did not exist. Codes above 599 are not valid HTTP status
+/// codes; retrying one repeats a request the server never understood.
+pub fn http_retry_class(status: u16) -> HttpRetryClass {
+    match status {
+        429 => HttpRetryClass::RateLimited,
+        500..=599 => HttpRetryClass::Transient,
+        _ => HttpRetryClass::Permanent,
+    }
+}
+
+impl HttpRetryClass {
+    /// Render this class as the `SyncError` the in-process paths carry.
+    ///
+    /// Lives here rather than inline in the wasm fetch adapter so a host test can
+    /// reach it. `crates/smugglr-wasm` is `#![cfg(target_arch = "wasm32")]` and
+    /// compiles to nothing off that target, so a mapping written inside it is
+    /// unreachable by `cargo test` -- which is how the divergence this function
+    /// exists to prevent went unnoticed in the first place.
+    pub fn into_sync_error(
+        self,
+        status: u16,
+        message: String,
+        retry_after: Option<u64>,
+    ) -> SyncError {
+        match self {
+            HttpRetryClass::RateLimited => SyncError::RateLimited { retry_after },
+            HttpRetryClass::Transient => SyncError::ServerError { status, message },
+            HttpRetryClass::Permanent => SyncError::Remote(message),
+        }
+    }
+}
+
 impl SyncError {
     /// Check if this error is retryable with exponential backoff.
     ///
@@ -255,6 +311,78 @@ impl SyncError {
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
+
+#[cfg(test)]
+mod http_retry_class_is_shared {
+    use super::*;
+
+    /// Pinned in core rather than in either adapter, because the defect was that
+    /// the two adapters disagreed and neither had a test that could notice.
+    /// `crates/smugglr-wasm` is `#![cfg(target_arch = "wasm32")]` and carries no
+    /// tests at all, so a host-side assertion here is the only place this can be
+    /// checked without a browser.
+    #[test]
+    fn the_retryable_statuses_are_the_ones_the_engine_retries() {
+        assert_eq!(http_retry_class(429), HttpRetryClass::RateLimited);
+        for s in [500, 502, 503, 504, 599] {
+            assert_eq!(http_retry_class(s), HttpRetryClass::Transient, "status {s}");
+        }
+        // 4xx other than 429 must NOT retry: the request is wrong and repeating
+        // it is wrong the same way.
+        for s in [400, 401, 403, 404, 409, 413, 415, 422] {
+            assert_eq!(http_retry_class(s), HttpRetryClass::Permanent, "status {s}");
+        }
+    }
+
+    /// The end-to-end assertion: a status goes in, and what comes out is an
+    /// error the engine actually retries.
+    ///
+    /// An earlier version of this test hand-built three `SyncError`s and called
+    /// `is_retryable` on them. Review caught that it never called
+    /// `http_retry_class`, never reached the rendering, and passed identically
+    /// before the fix -- it asserted a property of `is_retryable`, which this PR
+    /// does not touch, while claiming to cover the defect. This version runs the
+    /// whole path the wasm adapter runs.
+    #[test]
+    fn a_status_becomes_an_error_with_the_retry_behaviour_it_promises() {
+        let render = |status: u16| {
+            http_retry_class(status).into_sync_error(status, format!("HTTP {status}"), None)
+        };
+
+        // The two that must retry, and the bug: before the fix a 503 on the wasm
+        // path rendered to Remote, which is_retryable refuses.
+        assert!(render(429).is_retryable(), "429 must retry");
+        assert!(render(503).is_retryable(), "503 must retry");
+        assert!(matches!(
+            render(503),
+            SyncError::ServerError { status: 503, .. }
+        ));
+
+        // And the ones that must not, so the fix cannot be "retry everything".
+        for s in [400, 401, 403, 404, 409, 422] {
+            assert!(!render(s).is_retryable(), "{s} must not retry");
+            assert!(matches!(render(s), SyncError::Remote(_)), "{s} shape");
+        }
+
+        // A 429 carries Retry-After through to the variant that honours it.
+        assert!(matches!(
+            http_retry_class(429).into_sync_error(429, String::new(), Some(30)),
+            SyncError::RateLimited {
+                retry_after: Some(30)
+            }
+        ));
+    }
+
+    #[test]
+    fn a_status_above_the_5xx_range_is_permanent() {
+        // reqwest's is_server_error() is (500..600) and the plugin adapter relied
+        // on it. An unbounded `>= 500` silently made a 600-999 status retryable
+        // there; review caught it. 600+ is not a valid HTTP status.
+        assert_eq!(http_retry_class(599), HttpRetryClass::Transient);
+        assert_eq!(http_retry_class(600), HttpRetryClass::Permanent);
+        assert_eq!(http_retry_class(999), HttpRetryClass::Permanent);
+    }
+}
 
 #[cfg(test)]
 mod tests {
