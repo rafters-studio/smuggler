@@ -61,6 +61,15 @@ pub struct SyncResult {
     pub table: String,
     pub rows_pushed: usize,
     pub rows_pulled: usize,
+    /// Number of retries `upsert_with_retry` performed while writing this
+    /// table's rows (summed across push and pull, and across every batch).
+    /// Zero on a run where every batch succeeded on its first attempt --
+    /// this is what makes a sync that quietly backed off twice observable in
+    /// `--output json`, closing the gap #432 named: the retry machinery was
+    /// fully built and fully configured, but nobody could see it fire (#444).
+    /// Dry-run and the non-retrying paths (`stash`/`retrieve`, which call
+    /// `upsert_rows` directly) always leave this at zero.
+    pub retry_count: usize,
     /// Per-table diff breakdown, populated when diff was computed.
     pub diff_stats: Option<DiffStats>,
     /// Per-table PK lists from diff, populated for verbose dry-run output.
@@ -73,6 +82,7 @@ impl SyncResult {
             table: table.to_string(),
             rows_pushed: 0,
             rows_pulled: 0,
+            retry_count: 0,
             diff_stats: None,
             diff_detail: None,
         }
@@ -117,18 +127,23 @@ fn retry_delay_ms(err: &crate::error::SyncError, attempt: u32, retry: &RetryConf
 /// backoff. Permanent errors fail fast; transient errors (see
 /// [`crate::error::SyncError::is_retryable`]) retry up to `retry.max_retries`;
 /// exhaustion returns `RetryExhausted` (exit 3).
+///
+/// Returns `(rows upserted, retries performed)` -- the retry count is the
+/// number of times this chunk was retried before it succeeded (zero if the
+/// first attempt succeeded), which `transfer_rows` sums across every chunk
+/// and `push_table`/`pull_table` fold into [`SyncResult::retry_count`] (#444).
 #[cfg(feature = "native")]
 async fn upsert_with_retry<Dst: DataSource>(
     dest: &Dst,
     table: &str,
     chunk: &[HashMap<String, serde_json::Value>],
     retry: &RetryConfig,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     use crate::error::SyncError;
     let mut attempt: u32 = 0;
     loop {
         match dest.upsert_rows(table, chunk).await {
-            Ok(n) => return Ok(n),
+            Ok(n) => return Ok((n, attempt as usize)),
             Err(e) if e.is_retryable() && attempt < retry.max_retries => {
                 let delay = retry_delay_ms(&e, attempt, retry);
                 warn!(
@@ -153,21 +168,25 @@ async fn upsert_with_retry<Dst: DataSource>(
 }
 
 /// On WASM the engine upserts directly: retry/backoff for the browser is the JS
-/// autoSync layer's job, and there is no tokio timer in the wasm build.
+/// autoSync layer's job, and there is no tokio timer in the wasm build -- so
+/// this path never retries and always reports zero.
 #[cfg(not(feature = "native"))]
 async fn upsert_with_retry<Dst: DataSource>(
     dest: &Dst,
     table: &str,
     chunk: &[HashMap<String, serde_json::Value>],
     _retry: &RetryConfig,
-) -> Result<usize> {
-    dest.upsert_rows(table, chunk).await
+) -> Result<(usize, usize)> {
+    let n = dest.upsert_rows(table, chunk).await?;
+    Ok((n, 0))
 }
 
 /// Fetches rows by primary key from `source`, then upserts into `dest`
 /// in chunks (sized by `batch_config.batch_size`) with progress reporting
 /// via the provided [`SyncProgress`] implementation.
 /// Excluded columns are stripped before upserting.
+///
+/// Returns `(rows transferred, retries performed across every chunk)`.
 #[allow(clippy::too_many_arguments)]
 async fn transfer_rows<Src: DataSource, Dst: DataSource>(
     source: &Src,
@@ -178,22 +197,24 @@ async fn transfer_rows<Src: DataSource, Dst: DataSource>(
     exclude_columns: &[String],
     label: &str,
     progress: &dyn SyncProgress,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     let rows = source.get_rows(table, pk_values).await?;
 
     if rows.is_empty() {
         warn!("No rows found in source for {}", label);
-        return Ok(0);
+        return Ok((0, 0));
     }
 
     let rows = strip_excluded_columns(rows, exclude_columns);
 
     progress.on_transfer_start(rows.len(), label, table);
     let mut total = 0;
+    let mut total_retries = 0;
 
     for chunk in rows.chunks(batch_config.batch_size) {
-        let count = upsert_with_retry(dest, table, chunk, &batch_config.retry).await?;
+        let (count, retries) = upsert_with_retry(dest, table, chunk, &batch_config.retry).await?;
         total += count;
+        total_retries += retries;
         // Advance progress by the upsert-reported count, not the attempted
         // chunk size, so the running progress total always matches the final
         // `total` reported to on_transfer_finish even if an adapter returns
@@ -202,7 +223,7 @@ async fn transfer_rows<Src: DataSource, Dst: DataSource>(
     }
 
     progress.on_transfer_finish(total, label);
-    Ok(total)
+    Ok((total, total_retries))
 }
 
 /// Push changes from source to destination for a single table.
@@ -238,7 +259,7 @@ pub async fn push_table<Src: DataSource, Dst: DataSource>(
         return Ok(result);
     }
 
-    result.rows_pushed = transfer_rows(
+    let (rows_pushed, retry_count) = transfer_rows(
         source,
         dest,
         table,
@@ -249,6 +270,8 @@ pub async fn push_table<Src: DataSource, Dst: DataSource>(
         progress,
     )
     .await?;
+    result.rows_pushed = rows_pushed;
+    result.retry_count = retry_count;
     Ok(result)
 }
 
@@ -285,7 +308,7 @@ pub async fn pull_table<Src: DataSource, Dst: DataSource>(
         return Ok(result);
     }
 
-    result.rows_pulled = transfer_rows(
+    let (rows_pulled, retry_count) = transfer_rows(
         remote,
         local,
         table,
@@ -296,6 +319,8 @@ pub async fn pull_table<Src: DataSource, Dst: DataSource>(
         progress,
     )
     .await?;
+    result.rows_pulled = rows_pulled;
+    result.retry_count = retry_count;
     Ok(result)
 }
 
@@ -381,6 +406,7 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
         table: table.to_string(),
         rows_pushed: push_result.rows_pushed,
         rows_pulled: pull_result.rows_pulled,
+        retry_count: push_result.retry_count + pull_result.retry_count,
         diff_stats: stats,
         diff_detail: detail,
     })
@@ -1301,10 +1327,14 @@ mod tests {
                 permanent: false,
                 calls: AtomicU32::new(0),
             };
-            let n = upsert_with_retry(&dest, "t", &one_chunk(), &fast_retry(5))
+            let (n, retries) = upsert_with_retry(&dest, "t", &one_chunk(), &fast_retry(5))
                 .await
                 .unwrap();
             assert_eq!(n, 1);
+            // #444: the retry count this chunk needed before succeeding must be
+            // reported back, not just the final row count -- this is what
+            // eventually surfaces in SyncResult::retry_count and the sync JSON.
+            assert_eq!(retries, 2, "2 failed attempts before the 3rd succeeded");
             assert_eq!(
                 dest.calls.load(Ordering::SeqCst),
                 3,
@@ -1485,7 +1515,7 @@ mod tests {
                 finish_total: AtomicUsize::new(0),
             };
 
-            let total = transfer_rows(
+            let (total, retries) = transfer_rows(
                 &source,
                 &dest,
                 "items",
@@ -1499,6 +1529,10 @@ mod tests {
             .unwrap();
 
             assert_eq!(total, 2, "returned total is the sum of upsert counts");
+            assert_eq!(
+                retries, 0,
+                "UndercountDest never fails, so no retries occur"
+            );
             // The bug: progress advanced by chunk.len() (5) while finish total
             // was 2. After the fix both equal the returned total.
             assert_eq!(
