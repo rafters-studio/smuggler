@@ -77,7 +77,7 @@ use crate::config::StashConfig;
 #[cfg(feature = "native")]
 use crate::migrate::apply::{apply_ops, rebuild_to_schema, RebuildSpec, RebuildTarget};
 #[cfg(feature = "native")]
-use crate::migrate::ledger::{Election, Ledger, LedgerEntry};
+use crate::migrate::ledger::{Election, LedgerEntry};
 #[cfg(feature = "native")]
 use crate::migrate::lint::classify_op;
 #[cfg(feature = "native")]
@@ -886,7 +886,8 @@ pub async fn load_preimage(
 /// row a 0.5.0 apply produces. The ledger exposes no setter for the column -- it
 /// appears in `ledger.rs`'s `CREATE TABLE` and in the `SELECT` projections, and in
 /// no write path: the election insert does not list it, so every row is born NULL,
-/// and none of [`Ledger::mark_success`], [`Ledger::mark_failed`], or either lease
+/// and none of [`Ledger::mark_success`](crate::migrate::ledger::Ledger::mark_success),
+/// [`Ledger::mark_failed`](crate::migrate::ledger::Ledger::mark_failed), or either lease
 /// reclaim touches it afterwards. The forward driver (#296) returns the
 /// captured payload in its apply outcome instead of stashing a key on the row.
 /// Until some component takes ownership of writing it, a `Ref` pre-image reaches a
@@ -912,10 +913,13 @@ pub fn preimage_ref_of(entry: &LedgerEntry) -> Option<Preimage> {
 
 /// Apply a reverse as a **new, append-only compensating `version` step**.
 ///
-/// Elects `version` (`vN+1`) through the ledger's normal two-phase flow
-/// ([`Ledger::try_elect`] -> apply -> [`Ledger::mark_success`]); the reversed
-/// `vN` row is never popped, marked, or edited (that would trip the chain-hash
-/// tamper check). Additive reverses ride `down_ops` through
+/// Elects `version` (`vN+1`) and settles it through
+/// [`elect_apply_settle`](crate::migrate::driver::elect_apply_settle) -- the
+/// same claim-run-settle skeleton [`apply_migration`](crate::migrate::driver::apply_migration)
+/// calls, so this crate has exactly the one forward-apply loop `driver.rs`'s
+/// module doc requires, not a second hand-rolled copy of it (#463). The
+/// reversed `vN` row is never popped, marked, or edited (that would trip the
+/// chain-hash tamper check). Additive reverses ride `down_ops` through
 /// [`apply_ops`](crate::migrate::apply::apply_ops); a destructive reverse's
 /// structural + data restore rides `payload` through [`restore_payload`]. On a
 /// mid-apply failure the row is marked failed so it is immediately reclaimable.
@@ -928,6 +932,70 @@ pub fn preimage_ref_of(entry: &LedgerEntry) -> Option<Preimage> {
 /// enforces this: [`additive_down_ops`] errors on any destructive op, so a caller
 /// cannot assemble a mixed `down_ops` from a mixed `up` here.
 ///
+/// # No manifest-level guards run here, deliberately (#463)
+///
+/// `apply_migration` runs five guards against a full authored manifest:
+/// checksum verification and the `applied_version_of` already-applied
+/// short-circuit and the #427 rowid-alias refusal, all *before* it ever
+/// elects a version, plus `lint::lint_manifest` / `lint::enforce_preimage`,
+/// which run *after* election succeeds (inside the closure
+/// [`elect_apply_settle`](crate::migrate::driver::elect_apply_settle) calls,
+/// unchanged from before this extraction). This function runs none of the
+/// five, at either timing, and that is not an oversight this issue's
+/// extraction papers over -- each was checked against what a reverse
+/// actually is and rejected on its own terms:
+///
+/// - **Checksum verification** verifies a [`ChecksummedManifest`](crate::migrate::ChecksummedManifest)
+///   travelling as a sealed unit; `down_ops` and `payload` are not a sealed
+///   manifest, they are values this crate itself derived from one that
+///   already verified when it applied forward. There is nothing here shaped
+///   like the thing that check verifies.
+/// - **The `applied_version_of` already-applied check** keys on a checksum
+///   identifying the migration being applied. A reversal deliberately carries
+///   a *different* checksum than the manifest it reverses (that distinction
+///   is #419's whole subject); running this check here would not detect a
+///   double-reverse, since the "already applied" row it would need to find is
+///   the *original* `up`'s row, not one this reversal ever writes. Adding it
+///   would be cargo-culting the guard's shape onto a check it cannot perform.
+/// - **`lint::lint_manifest` / `lint::enforce_preimage`** judge freshly
+///   user-authored `up` ops for destructive-without-preimage shape. A
+///   `down_ops` assembled by [`additive_down_ops`] -- the only producer of
+///   `down_ops` in this crate -- is never user-authored: it is the
+///   structural inverse of `up` ops that already passed this exact lint when
+///   they applied forward. A `payload` restore likewise carries its own
+///   captured pre-image and needs no fresh one enforced. Re-linting an
+///   inverse the crate generated from already-linted input judges nothing
+///   new.
+/// - **The #427 rowid-alias refusal** rejects a `CreateTable` minting a
+///   rowid alias / `AUTOINCREMENT` primary key. [`structural_inverse`] never
+///   produces a `CreateTable` -- a `CreateTable` in `up` inverts to
+///   `DropTable`, never to another `CreateTable` -- so this shape cannot
+///   occur in a `down_ops` built by [`additive_down_ops`].
+///
+/// Both of the last two claims are scoped to `down_ops` as
+/// [`additive_down_ops`] assembles it, not to this function's parameter in
+/// general: `down_ops: &[ClassifiedOp]` is caller-supplied, and nothing in
+/// this function's signature stops a caller handing it a hand-rolled
+/// `Op::CreateTable` with a rowid-alias key, or an op that never passed
+/// lint. No guard here checks a hand-assembled `down_ops` -- the same is
+/// true of `apply_ops` itself, which this function already calls with no
+/// guard between the caller's `down_ops` and the database. A reversal
+/// composed the sanctioned way (through [`additive_down_ops`] or a captured
+/// `payload`) is applying the inverse of a manifest that already succeeded,
+/// not a fresh authored one, and every guard above is scoped to the latter.
+/// If a future op inversion changes that (a `down_ops` inverse that *can*
+/// mint fresh DDL, say), the guard it needs is a fresh judgement call
+/// against that op, not a mechanical import of this list.
+///
+/// # #419 is unchanged by this extraction
+///
+/// This function still does not, and this change does not make it, link a
+/// reversal back to the version it reversed -- #419 (a reversed migration can
+/// never be re-applied) is untouched in both directions. The already-applied
+/// check `apply_migration` runs is one of the five guards deliberately not
+/// carried onto this path (see above), so this extraction cannot resolve
+/// #419 by omission, and nothing here adds a new way to trip it either.
+///
 /// Returns the [`Election`] outcome: `Won` means the step applied, anything else
 /// means it was already applied or is held by another node (the caller backs off).
 #[cfg(feature = "native")]
@@ -939,29 +1007,21 @@ pub fn apply_compensating(
     payload: Option<&PreimagePayload>,
     lease_secs: i64,
 ) -> crate::error::Result<Election> {
-    let election = Ledger::try_elect(conn, version, checksum, lease_secs)?;
-    if election != Election::Won {
-        return Ok(election);
-    }
-    let outcome = (|| -> crate::error::Result<()> {
-        let mut noop = |_: &ClassifiedOp| -> Result<(), MigrateError> { Ok(()) };
-        apply_ops(conn, down_ops, &mut noop)?;
-        if let Some(p) = payload {
-            restore_payload(conn, p)?;
-        }
-        Ok(())
-    })();
-    match outcome {
-        Ok(()) => {
-            Ledger::mark_success(conn, version)?;
-            Ok(Election::Won)
-        }
-        Err(e) => {
-            // Best-effort: leave the row reclaimable. The original error wins.
-            let _ = Ledger::mark_failed(conn, version);
-            Err(e)
-        }
-    }
+    let (election, _) = crate::migrate::driver::elect_apply_settle(
+        conn,
+        version,
+        checksum,
+        lease_secs,
+        |conn| -> crate::error::Result<()> {
+            let mut noop = |_: &ClassifiedOp| -> Result<(), MigrateError> { Ok(()) };
+            apply_ops(conn, down_ops, &mut noop)?;
+            if let Some(p) = payload {
+                restore_payload(conn, p)?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(election)
 }
 
 #[cfg(test)]
@@ -2061,6 +2121,58 @@ mod tests {
             );
             // Writing the column did not break the chain.
             Ledger::verify_chain(&conn).unwrap();
+        }
+
+        // -- #463: apply_compensating shares driver.rs's elect_apply_settle -
+
+        /// Non-vacuity for #463's extraction: before it, `apply_compensating`
+        /// settled success with a bare `Ledger::mark_success(conn, version)?`
+        /// and no fallback -- if THAT call itself errored (as opposed to the
+        /// down_ops/payload apply above it), the row was left `pending` with
+        /// a live lease, exactly the abandoned-pending state the ledger's
+        /// crash table (`driver.rs` module doc) exists to rule out.
+        /// `apply_migration` already funnelled a `mark_success` failure into
+        /// the same best-effort `mark_failed` as any other mid-run error;
+        /// `apply_compensating` did not. Sharing `elect_apply_settle` gives
+        /// it that fallback for free -- this test is the guard that did not
+        /// fire before the extraction and does now.
+        ///
+        /// A trigger that fails only the `UPDATE ... SET status = 'success'`
+        /// isolates the settle step alone: `down_ops` and `payload` are both
+        /// empty, so there is nothing else in this run that could fail.
+        #[test]
+        fn compensating_step_falls_back_to_mark_failed_when_mark_success_itself_errors() {
+            let conn = Connection::open_in_memory().unwrap();
+            Ledger::ensure_schema(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER poison_success
+                     BEFORE UPDATE OF status ON \"{}\"
+                     WHEN NEW.status = 'success'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced mark_success failure for #463 test');
+                 END;",
+                crate::migrate::ledger::LEDGER_TABLE
+            ))
+            .unwrap();
+
+            let err = apply_compensating(&conn, 9, "c9", &[], None, 300).unwrap_err();
+            assert!(
+                err.to_string().contains("forced mark_success failure"),
+                "the poisoned mark_success's own error must surface, not a different one: {err}"
+            );
+
+            let entry = Ledger::entry(&conn, 9).unwrap().unwrap();
+            assert_eq!(
+                entry.status,
+                MigrationStatus::Failed,
+                "a mark_success failure must fall back to mark_failed via the shared \
+                 elect_apply_settle funnel, not leave the row pending with a live lease"
+            );
+            // And, exactly like any other failed row, immediately re-electable.
+            assert_eq!(
+                Ledger::try_elect(&conn, 9, "c9", 300).unwrap(),
+                Election::Won
+            );
         }
     }
 }
