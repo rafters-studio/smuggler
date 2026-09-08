@@ -131,65 +131,21 @@ impl FetchDataSource {
             .map_err(|e| SyncError::Remote(format!("JSON deserialization failed: {}", e)))
     }
 
+    /// Rows for a response, delegated to the profile (#436).
+    ///
+    /// This and `extract_columns` were byte-identical copies here and in the
+    /// wasm fetch adapter, which is why the d1 column-source defect broke both
+    /// paths at once. One implementation now, in `Profile`.
     fn extract_rows(&self, response: &Value, columns: &[String]) -> Result<Vec<Vec<Value>>> {
-        let rows_val = Profile::extract_path(response, &self.profile.rows_path)
-            .ok_or_else(|| SyncError::Remote("rows not found in response".into()))?;
-
-        match rows_val.as_array() {
-            Some(arr) => Ok(arr
-                .iter()
-                .map(|row| {
-                    if let Some(arr) = row.as_array() {
-                        arr.clone()
-                    } else if let Some(obj) = row.as_object() {
-                        columns
-                            .iter()
-                            .map(|c| obj.get(c).cloned().unwrap_or(Value::Null))
-                            .collect()
-                    } else {
-                        vec![row.clone()]
-                    }
-                })
-                .collect()),
-            None => Ok(vec![]),
-        }
+        self.profile
+            .extract_rows(response, columns)
+            .ok_or_else(|| SyncError::Remote("rows not found in response".into()))
     }
 
     fn extract_columns(&self, response: &Value) -> Result<Vec<String>> {
-        if let Some(cols_val) = Profile::extract_path(response, &self.profile.columns_path) {
-            if let Some(arr) = cols_val.as_array() {
-                let names: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| {
-                        if let Some(s) = v.as_str() {
-                            Some(s.to_string())
-                        } else if let Some(obj) = v.as_object() {
-                            obj.get("name").and_then(|n| n.as_str()).map(String::from)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                if !names.is_empty() {
-                    return Ok(names);
-                }
-
-                if let Some(first) = arr.first().and_then(|v| v.as_object()) {
-                    return Ok(first.keys().cloned().collect());
-                }
-            }
-        }
-
-        if let Some(rows_val) = Profile::extract_path(response, &self.profile.rows_path) {
-            if let Some(arr) = rows_val.as_array() {
-                if let Some(first) = arr.first().and_then(|v| v.as_object()) {
-                    return Ok(first.keys().cloned().collect());
-                }
-            }
-        }
-
-        Err(SyncError::Remote("columns not found in response".into()))
+        self.profile
+            .extract_columns(response)
+            .ok_or_else(|| SyncError::Remote("columns not found in response".into()))
     }
 
     /// Query row metadata for rows with `timestamp_column > since_timestamp`.

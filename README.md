@@ -152,7 +152,7 @@ url = "https://my-db.turso.io"
 auth_token = "${TURSO_TOKEN}"
 ```
 
-Profiles: `d1`, `turso`, `rqlite`, `datasette`, `sqlite-cloud`, `starbasedb`, `generic`, `http-sql`. Eight. A backend whose requests fit one of those shapes is a config change; a backend that speaks a new shape is a profile in the plugin. `${VAR}` and `${VAR:-default}` expand at load; an unset variable exits 2. The `d1` path is not working in 0.5.0; see Known limits.
+Profiles: `d1`, `turso`, `rqlite`, `datasette`, `sqlite-cloud`, `starbasedb`, `generic`, `http-sql`. Eight. A backend whose requests fit one of those shapes is a config change; a backend that speaks a new shape is a profile in the plugin. `${VAR}` and `${VAR:-default}` expand at load; an unset variable exits 2. The `d1` path was broken in 0.5.0 and is fixed but unrun for 0.5.1; see Known limits.
 
 ### A relay, for machines that cannot reach each other
 
@@ -300,7 +300,7 @@ after:  a=3, b=3
 
 Each of these is a reader's first ten minutes, stated here so it is met in the docs and not in production.
 
-**D1 does not work from the CLI.** Three independent defects, two now fixed: the CLI handed the plugin the wrong keys and no URL (#429, fixed for 0.5.1), the 0.5.0 archive and `cargo install smugglr` shipped no plugin at all (#430, fixed for 0.5.1), and the `d1` profile still reads its rows as its column list, so table discovery collapses on the plugin and wasm paths alike (#436). The request now leaves with the right URL and an `Authorization` header; what comes back is still misread. The npm example builds the D1 URL itself and works against a generic endpoint; against real D1 it hits #436. Until #436 lands, do not point this at D1 and expect rows.
+**D1 from the CLI is fixed but unproven.** Three independent defects blocked it in 0.5.0 and all three are fixed for 0.5.1: the CLI handed the plugin the wrong keys and no URL (#429), the archive and `cargo install smugglr` shipped no plugin at all (#430), and the `d1` profile read its rows as its column list, so table discovery collapsed on the plugin and wasm paths alike (#436). What is missing is a run. Every fix is covered by tests that drive a real adapter against a local endpoint answering in D1's documented response shape, but nobody has pointed this at a live D1 database since, because that needs a Cloudflare account and a token this repository does not have. Treat it as untested against the service rather than as known-broken or known-good.
 
 **`uuid_v7_wins` is `newer_wins`.** No code reads the key's timestamp; the variant orders on `timestamp_column` like `newer_wins` and prints a different warning (#431).
 
