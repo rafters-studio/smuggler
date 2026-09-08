@@ -4,7 +4,7 @@ A Node script reads a local SQLite database and pushes its rows to an HTTP-SQL e
 
 ## Prerequisites
 
-Node 24 (the capture ran on 24.12.0; the scripts use `--env-file` and `import.meta.resolve`, and the local endpoint uses `node:sqlite`), pnpm, the `sqlite3` shell, and a `smugglr` binary for `../westwind/make.sh` (on your PATH, or named in `SMUGGLR`). For the D1 variant, a D1 database and an API token with `D1:Edit` scope from <https://dash.cloudflare.com/profile/api-tokens>.
+Node 24 (the capture ran on 24.12.0; the scripts use `--env-file`, and the local endpoint uses `node:sqlite`), pnpm, the `sqlite3` shell, and a `smugglr` binary for `../westwind/make.sh` (on your PATH, or named in `SMUGGLR`). For the D1 variant, a D1 database and an API token with `D1:Edit` scope from <https://dash.cloudflare.com/profile/api-tokens>.
 
 ## Setup
 
@@ -67,7 +67,6 @@ node --env-file=.env push.mjs
 ```
 
 ```
-loaded smugglr wasm: 316800 bytes
 push complete: {"command":"push","status":"ok","tables":[{"name":"categories","rowsPushed":8},{"name":"customers","rowsPushed":40},{"name":"employees","rowsPushed":9},{"name":"order_details","rowsPushed":788},{"name":"orders","rowsPushed":320},{"name":"products","rowsPushed":20},{"name":"shippers","rowsPushed":3},{"name":"suppliers","rowsPushed":8}]}
 ```
 
@@ -78,7 +77,6 @@ node --env-file=.env push.mjs
 ```
 
 ```
-loaded smugglr wasm: 316800 bytes
 push complete: {"command":"push","status":"ok","tables":[{"name":"categories"},{"name":"customers"},{"name":"employees"},{"name":"order_details"},{"name":"orders"},{"name":"products"},{"name":"shippers"},{"name":"suppliers"}]}
 ```
 
@@ -88,7 +86,7 @@ Uncomment the three D1 lines in `.env` and fill in the account id, database id, 
 
 ## What this demonstrates
 
-The `smugglr` package runs in Node with the same WebAssembly binary the browser gets. The binary is 316,800 bytes on disk in 0.5.0 and 126,497 bytes gzipped. One thing differs from the browser: the wasm-bindgen loader fetches the binary relative to its glue module, and Node's `fetch` has no `file:` scheme, so a bare `Smugglr.init()` fails with `fetch failed`. The script reads the bytes itself, hands them to the glue module's initializer, then registers the module with `setWasm` before the first `init()`.
+The `smugglr` package runs in Node with the same WebAssembly binary the browser gets. The binary is 316,800 bytes on disk in 0.5.0 and 126,497 bytes gzipped. Node's `fetch` has no `file:` scheme, so the wasm-bindgen loader's normal fetch-relative-to-the-glue-module path cannot work there; `Smugglr.init()` detects the Node runtime and reads the bundled `.wasm` bytes with `node:fs` instead, so the script above never touches WASM loading at all -- `push.mjs` is a plain `Smugglr.init(config)` call.
 
 A `LocalEndpointConfig` with a custom `SqlExecutor` plugs any SQLite runtime into the local side. The executor here wraps `better-sqlite3` in ten lines: bind `params` positionally, and answer with `{columns, rows}` where each row is an array in column order. The same shape works for sql.js, the official sqlite-wasm package, or your own.
 
@@ -100,6 +98,6 @@ Table selection is the intersection of both sides' table lists, minus `excludeTa
 
 | File | Purpose |
 | ---- | ------- |
-| `push.mjs` | The example. Loads the WASM, wraps `better-sqlite3`, calls `push()` once. |
+| `push.mjs` | The example. Wraps `better-sqlite3`, calls `push()` once. |
 | `local-endpoint.mjs` | The `generic`-profile HTTP-SQL endpoint the capture ran against. `POST /fail/<n>` makes the next `n` queries answer 503; [node-auto-sync](../node-auto-sync/) uses that. |
 | `.env.example` | Local endpoint values, with the D1 variant commented out. |

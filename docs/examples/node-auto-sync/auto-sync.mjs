@@ -6,10 +6,8 @@
 // navigator.locks and the `online` event, and is a no-op in Node. This loop
 // is the Node equivalent.
 
-import { readFile } from "node:fs/promises";
 import Database from "better-sqlite3";
-import { Smugglr, SmugglrError, setWasm } from "smugglr";
-import * as wasm from "smugglr/wasm";
+import { Smugglr, SmugglrError } from "smugglr";
 
 for (const key of ["DEST_URL", "LOCAL_DB"]) {
   if (!process.env[key]) {
@@ -17,13 +15,6 @@ for (const key of ["DEST_URL", "LOCAL_DB"]) {
     process.exit(2);
   }
 }
-
-// Node's fetch has no file: scheme, so load the .wasm bytes by hand.
-const wasmBytes = await readFile(
-  new URL("smugglr_wasm_bg.wasm", import.meta.resolve("smugglr/wasm")),
-);
-await wasm.default({ module_or_path: wasmBytes });
-await setWasm(wasm);
 
 const db = new Database(process.env.LOCAL_DB);
 const executor = {

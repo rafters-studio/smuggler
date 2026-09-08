@@ -52,9 +52,16 @@ export type {
 let wasmModule: WasmModule | null = null;
 let wasmReady: Promise<WasmModule> | null = null;
 
+// Raw forms wasm-bindgen's initializer accepts, wrapped in `{ module_or_path }`
+// before we ever pass them in -- the bare forms are the deprecated calling
+// convention (see loadWasm/setWasm below).
+type WasmInitInput = RequestInfo | URL | BufferSource | WebAssembly.Module;
+
 // Minimal interface for the wasm-bindgen output we depend on.
 interface WasmModule {
-  default: (input?: RequestInfo | URL | BufferSource | WebAssembly.Module) => Promise<unknown>;
+  default: (input?: {
+    module_or_path?: WasmInitInput | Promise<WasmInitInput>;
+  }) => Promise<unknown>;
   Smugglr: {
     init(config: unknown): WasmSmugglr;
     new (): never;
@@ -102,14 +109,15 @@ interface WasmSmugglr {
  *   `BufferSource`, or a compiled `WebAssembly.Module`). Omit it to use the
  *   module's default-resolved binary.
  */
-export async function setWasm(
-  mod: WasmModule,
-  input?: RequestInfo | URL | BufferSource | WebAssembly.Module,
-): Promise<WasmModule> {
+export async function setWasm(mod: WasmModule, input?: WasmInitInput): Promise<WasmModule> {
   // Actually instantiate the WebAssembly instance. Without this the
   // wasm-bindgen glue is loaded but no memory/exports exist, so the first
   // Smugglr.init() faults against an uninitialized module.
-  await mod.default(input);
+  //
+  // Passing `input` bare (rather than wrapped in `{ module_or_path }`) hits
+  // wasm-bindgen's deprecated calling convention and logs a warning on every
+  // call -- wrap it even though `input` itself is never already-wrapped.
+  await mod.default({ module_or_path: input });
   wasmModule = mod;
   wasmReady = Promise.resolve(mod);
   return mod;
@@ -119,18 +127,14 @@ async function loadWasm(options?: InitOptions): Promise<WasmModule> {
   if (wasmReady) return wasmReady;
 
   wasmReady = (async () => {
-    // If the consumer passed a module directly, use it.
-    if (options?.wasmModule) {
-      const mod = options.wasmModule as WasmModule;
-      await mod.default();
-      wasmModule = mod;
-      return mod;
-    }
+    // If the consumer passed a module directly, use it; otherwise dynamic-import
+    // the co-located wasm-bindgen output.
+    const mod = options?.wasmModule
+      ? (options.wasmModule as WasmModule)
+      : ((await import("./wasm/smugglr_wasm.js")) as WasmModule);
 
-    // Default: dynamic import of the co-located wasm-bindgen output.
-    // This path is rewritten by the build script to point at the bundled copy.
-    const mod = await import("./wasm/smugglr_wasm.js") as WasmModule;
-    await mod.default(options?.wasmUrl);
+    const input = options?.wasmUrl ?? (await defaultWasmInput());
+    await mod.default({ module_or_path: input });
     wasmModule = mod;
     return mod;
   })().catch((e) => {
@@ -142,6 +146,29 @@ async function loadWasm(options?: InitOptions): Promise<WasmModule> {
   });
 
   return wasmReady;
+}
+
+// wasm-bindgen's default initializer resolves the `.wasm` binary relative to
+// the glue module's own URL and fetches it -- and Node's `fetch` has no
+// `file:` scheme handler, so a bare `Smugglr.init()` in Node fails with
+// "fetch failed" unless the caller preloads the bytes by hand (setWasm).
+//
+// Under Node, read the bundled binary ourselves and hand the bytes straight
+// to the initializer so it never has to fetch a file: URL. Everywhere else
+// (browser, or a bundler-rewritten import) leave it undefined so
+// wasm-bindgen resolves and fetches its own default.
+async function defaultWasmInput(): Promise<BufferSource | undefined> {
+  if (!isNodeRuntime()) return undefined;
+  const { readFile } = await import("node:fs/promises");
+  return await readFile(new URL("./wasm/smugglr_wasm_bg.wasm", import.meta.url));
+}
+
+function isNodeRuntime(): boolean {
+  return (
+    typeof process !== "undefined" &&
+    process.versions != null &&
+    typeof process.versions.node === "string"
+  );
 }
 
 /** smugglr sync client for browser and Node.js */

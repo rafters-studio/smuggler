@@ -3,10 +3,8 @@
 //
 // Run: node --env-file=.env push.mjs
 
-import { readFile } from "node:fs/promises";
 import Database from "better-sqlite3";
-import { Smugglr, setWasm } from "smugglr";
-import * as wasm from "smugglr/wasm";
+import { Smugglr } from "smugglr";
 
 for (const key of ["DEST_URL", "LOCAL_DB"]) {
   if (!process.env[key]) {
@@ -14,16 +12,6 @@ for (const key of ["DEST_URL", "LOCAL_DB"]) {
     process.exit(2);
   }
 }
-
-// The wasm-bindgen loader fetches the .wasm binary relative to the glue
-// module. Node's fetch has no file: scheme, so read the bytes ourselves and
-// hand them to the loader before the first init().
-const wasmBytes = await readFile(
-  new URL("smugglr_wasm_bg.wasm", import.meta.resolve("smugglr/wasm")),
-);
-await wasm.default({ module_or_path: wasmBytes });
-await setWasm(wasm);
-console.log(`loaded smugglr wasm: ${wasmBytes.length} bytes`);
 
 const db = new Database(process.env.LOCAL_DB);
 
