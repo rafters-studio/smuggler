@@ -131,7 +131,7 @@ For each table smugglr reads every primary key from both sides and hashes each r
 | `content_differs` | same timestamp, different content | by policy | by policy |
 | `identical` | equal | skip | skip |
 
-`conflict_resolution` settles `content_differs`: `local_wins` (the default), `remote_wins`, or `newer_wins`, which skips a row with no usable timestamp and says so once per table. Writes are upserts; nothing deletes. On the native path tables are written in whichever order the set iterates, which changes from run to run; the relay and the wasm client sort them. Timestamps lie, clocks drift, and bulk imports stamp everything "now", which is why the hash decides whether a row changed and the timestamp only decides which way it moves.
+`conflict_resolution` settles `content_differs`: `local_wins` (the default), `remote_wins`, or `newer_wins`, which skips a row with no usable timestamp and says so once per table. Writes are upserts; nothing deletes. On the native path tables are written in whichever order the set iterates, which changes from run to run; the relay and the wasm client sort them. Timestamps lie, clocks drift, and bulk imports stamp everything "now", which is why the hash decides whether a row changed and the timestamp only decides which way it moves. `uuid_v7_wins` is a deprecated alias for `newer_wins` -- it never compared a UUID, because every conflict resolves between two rows sharing one identical primary key, leaving no second key to read a timestamp from. A config using it still loads and warns once (#431); write `newer_wins` directly.
 
 ## The shapes
 
@@ -301,8 +301,6 @@ after:  a=3, b=3
 Each of these is a reader's first ten minutes, stated here so it is met in the docs and not in production.
 
 **D1 from the CLI is fixed but unproven.** Three independent defects blocked it in 0.5.0 and all three are fixed for 0.5.1: the CLI handed the plugin the wrong keys and no URL (#429), the archive and `cargo install smugglr` shipped no plugin at all (#430), and the `d1` profile read its rows as its column list, so table discovery collapsed on the plugin and wasm paths alike (#436). What is missing is a run. Every fix is covered by tests that drive a real adapter against a local endpoint answering in D1's documented response shape, but nobody has pointed this at a live D1 database since, because that needs a Cloudflare account and a token this repository does not have. Treat it as untested against the service rather than as known-broken or known-good.
-
-**`uuid_v7_wins` is `newer_wins`.** No code reads the key's timestamp; the variant orders on `timestamp_column` like `newer_wins` and prints a different warning (#431).
 
 **Retries never fire for hosted backends.** The engine's backoff is real, but the plugin reports every 429 and 5xx as permanent, so a rate limit ends a push on the first response with exit 1 (#432).
 

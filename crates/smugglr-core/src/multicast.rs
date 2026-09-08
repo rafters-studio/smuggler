@@ -783,25 +783,16 @@ impl Gossip {
             // Only newer_wins needs an ordering signal; the other policies are
             // decided by the shape of the write alone.
             let ordering: Vec<String> = match self.conflict_resolution {
-                ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins
-                    if self.ordering_columns.is_empty() =>
-                {
+                ConflictResolution::NewerWins if self.ordering_columns.is_empty() => {
                     vec![config.sync.timestamp_column.clone()]
                 }
-                ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins => {
-                    self.ordering_columns.clone()
-                }
+                ConflictResolution::NewerWins => self.ordering_columns.clone(),
                 _ => Vec::new(),
             };
             let guard = match self.conflict_resolution {
                 ConflictResolution::RemoteWins => UpsertGuard::Replace,
                 ConflictResolution::LocalWins => UpsertGuard::KeepLocal,
-                // A same-PK collision carries the same UUID on both sides, so
-                // uuid_v7_wins has nothing to break the tie with and is exactly
-                // newer_wins here.
-                ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins => {
-                    UpsertGuard::NewerBy(&ordering)
-                }
+                ConflictResolution::NewerWins => UpsertGuard::NewerBy(&ordering),
             };
 
             match local.upsert_rows_guarded(&d.table, &d.upserts, guard) {

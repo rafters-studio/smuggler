@@ -122,12 +122,12 @@ impl TableDiff {
     }
 
     /// Content-differing rows this policy leaves UNRESOLVED -- skipped in both
-    /// directions because there's no usable tiebreaker. `newer_wins` /
-    /// `uuid_v7_wins` skip same-timestamp/same-PK conflicts; `local_wins` /
-    /// `remote_wins` always resolve them, so none are unresolved.
+    /// directions because there's no usable tiebreaker. `newer_wins` skips
+    /// same-timestamp conflicts; `local_wins` / `remote_wins` always resolve
+    /// them, so none are unresolved.
     pub fn unresolved_conflicts(&self, conflict_resolution: ConflictResolution) -> &[String] {
         match conflict_resolution {
-            ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins => &self.content_differs,
+            ConflictResolution::NewerWins => &self.content_differs,
             ConflictResolution::LocalWins | ConflictResolution::RemoteWins => &[],
         }
     }
@@ -147,9 +147,6 @@ impl TableDiff {
         let reason = match conflict_resolution {
             ConflictResolution::NewerWins => {
                 "missing or incomparable timestamps (skipped under newer_wins)"
-            }
-            ConflictResolution::UuidV7Wins => {
-                "same PK with identical UUIDv7 timestamp (skipped under uuid_v7_wins)"
             }
             ConflictResolution::LocalWins | ConflictResolution::RemoteWins => return,
         };
@@ -302,7 +299,7 @@ pub fn classify_diff(
                 // reconciliation mechanism the feature depends on is absent. And
                 // `content_differs` would not rescue that table either: under
                 // local_wins/remote_wins it churn-retransfers every row forever,
-                // under newer_wins/uuid_v7_wins it moves nothing, which is the
+                // under newer_wins it moves nothing, which is the
                 // same practical outcome as today with a warning attached.
                 //
                 // The genuine gap is that the state is SILENT -- nothing tells an
@@ -385,46 +382,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_uuidv7_wins_push_includes_local_only_and_newer() {
+    fn test_newer_wins_push_includes_local_only_and_newer() {
         let diff = TableDiff {
             table: "items".to_string(),
-            local_only: vec!["018ec7e6-1a80-7000-8000-aaaaaaaaaaaa".to_string()],
-            remote_only: vec!["018ec7e6-1a81-7000-8000-bbbbbbbbbbbb".to_string()],
+            local_only: vec!["pk1".to_string()],
+            remote_only: vec!["pk2".to_string()],
             local_newer: vec!["pk3".to_string()],
             remote_newer: vec!["pk4".to_string()],
             content_differs: vec![],
             identical: vec![],
         };
 
-        let push = diff.rows_to_push(ConflictResolution::UuidV7Wins);
+        let push = diff.rows_to_push(ConflictResolution::NewerWins);
         assert_eq!(push.len(), 2);
-        assert!(push.contains(&"018ec7e6-1a80-7000-8000-aaaaaaaaaaaa".to_string()));
+        assert!(push.contains(&"pk1".to_string()));
         assert!(push.contains(&"pk3".to_string()));
 
-        let pull = diff.rows_to_pull(ConflictResolution::UuidV7Wins);
+        let pull = diff.rows_to_pull(ConflictResolution::NewerWins);
         assert_eq!(pull.len(), 2);
-        assert!(pull.contains(&"018ec7e6-1a81-7000-8000-bbbbbbbbbbbb".to_string()));
+        assert!(pull.contains(&"pk2".to_string()));
         assert!(pull.contains(&"pk4".to_string()));
     }
 
     #[test]
-    fn test_uuidv7_wins_content_differs_skipped() {
+    fn test_newer_wins_content_differs_skipped() {
         let diff = TableDiff {
             table: "items".to_string(),
             local_only: vec![],
             remote_only: vec![],
             local_newer: vec![],
             remote_newer: vec![],
-            content_differs: vec!["018ec7e6-1a80-7000-8000-aaaaaaaaaaaa".to_string()],
+            content_differs: vec!["pk1".to_string()],
             identical: vec![],
         };
 
-        assert!(diff.rows_to_push(ConflictResolution::UuidV7Wins).is_empty());
-        assert!(diff.rows_to_pull(ConflictResolution::UuidV7Wins).is_empty());
+        assert!(diff.rows_to_push(ConflictResolution::NewerWins).is_empty());
+        assert!(diff.rows_to_pull(ConflictResolution::NewerWins).is_empty());
     }
 
     #[test]
-    fn unresolved_conflicts_tracks_only_newer_and_uuid() {
+    fn unresolved_conflicts_tracks_only_newer() {
         let diff = TableDiff {
             table: "t".to_string(),
             local_only: vec![],
@@ -434,14 +431,9 @@ mod tests {
             content_differs: vec!["a".to_string(), "b".to_string()],
             identical: vec![],
         };
-        // newer/uuid leave same-content conflicts unresolved (skipped both ways)
+        // newer_wins leaves same-content conflicts unresolved (skipped both ways)
         assert_eq!(
             diff.unresolved_conflicts(ConflictResolution::NewerWins)
-                .len(),
-            2
-        );
-        assert_eq!(
-            diff.unresolved_conflicts(ConflictResolution::UuidV7Wins)
                 .len(),
             2
         );
@@ -460,23 +452,6 @@ mod tests {
         // local_wins pushes them; remote_wins pulls them.
         assert_eq!(diff.rows_to_push(ConflictResolution::LocalWins).len(), 2);
         assert_eq!(diff.rows_to_pull(ConflictResolution::RemoteWins).len(), 2);
-    }
-
-    #[test]
-    fn test_non_uuidv7_falls_back_to_newer_wins_behavior() {
-        let diff = TableDiff {
-            table: "scores".to_string(),
-            local_only: vec![],
-            remote_only: vec![],
-            local_newer: vec!["42".to_string()],
-            remote_newer: vec![],
-            content_differs: vec!["99".to_string()],
-            identical: vec![],
-        };
-
-        let push = diff.rows_to_push(ConflictResolution::UuidV7Wins);
-        assert_eq!(push, vec!["42".to_string()]);
-        assert!(diff.rows_to_pull(ConflictResolution::UuidV7Wins).is_empty());
     }
 
     // --- Integer-timestamp conflict resolution (#176 / #177) ---
