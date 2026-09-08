@@ -72,6 +72,23 @@
 //! leaves a real key on the rest (#273), and a verbatim declaration would bring
 //! its own `PRIMARY KEY` tag into a body about to be given one.
 //!
+//! A lone surviving `INTEGER` key column is where derivation used to lose a
+//! fact `PRAGMA table_info` never carried: whether that column's `PRIMARY KEY`
+//! was declared `DESC`. Ascending and `DESC` report identically through the
+//! pragma -- position only, never direction -- and a bare re-declared
+//! `PRIMARY KEY` is SQLite's rowid alias, so re-deriving one always ascending
+//! silently turned a `DESC` key into the alias it never was, changing what
+//! values the column takes on the next `INSERT` that omits it (#413). The
+//! stored `CREATE TABLE` DDL is asked instead (`pk_check::column_level_pk_is_desc`):
+//! a column declared column-level `DESC` is re-declared `DESC`, the one
+//! column-level spelling that keeps a lone `INTEGER` primary key from being
+//! the alias, and a stored DDL that will not parse refuses the rebuild by
+//! name rather than guessing. Deliberately narrow, not "was this column
+//! already the alias": a composite key's surviving member never had an
+//! ASC/DESC spelling of its own, and a `WITHOUT ROWID` table's key has no
+//! rowid to be an alias of, so both keep re-deriving ascending exactly as
+//! before -- untouched, and untested either direction, by this fix.
+//!
 //! That exception costs more than tag placement, and saying only "the key is
 //! derived" understates it. **A key column still loses everything the pragma
 //! cannot report**: an expression `DEFAULT` on one is still re-emitted without
@@ -630,6 +647,58 @@ fn rebuild_dropping_column(
         None
     };
 
+    // A lone surviving INTEGER PK column reconstructs below as a bare
+    // `PRIMARY KEY`, and a bare `INTEGER PRIMARY KEY` IS SQLite's rowid alias
+    // (#413). `PRAGMA table_info` cannot tell that spelling apart from
+    // `INTEGER PRIMARY KEY DESC`, which is NOT one -- position only, never
+    // direction -- so ask the one place the direction survives: the stored
+    // `CREATE TABLE` DDL.
+    //
+    // Deliberately narrow: this asks only "was `PRIMARY KEY DESC` declared
+    // column-level on this column", not the broader "was this column already
+    // the rowid alias". That broader question answers "no" -- and this
+    // fix must not act on -- for a composite key's surviving member (never
+    // had an ASC/DESC spelling of its own) and for a `WITHOUT ROWID` table's
+    // key (no rowid to be an alias of, so ASC/DESC there is ordinary index
+    // direction, not this question at all); both fall through to the
+    // ascending re-declaration this rebuild already emitted, unchanged, which
+    // is #413's scope boundary, not an oversight.
+    //
+    // - Declared column-level `DESC`: re-declaring it ascending would start
+    //   drawing its values from the rowid sequence on every future INSERT
+    //   that omits it, silently -- so `DESC` is what gets re-declared
+    //   instead, the one column-level spelling that keeps a lone INTEGER PK
+    //   column from being the alias.
+    // - Not declared column-level `DESC` (ascending, table-level, or
+    //   composite): the ascending re-declaration below is unchanged.
+    // - Undeterminable (the stored DDL will not parse): refuse rather than
+    //   guess, the same rule the verbatim recovery below already follows for
+    //   an uncertain generated-column split.
+    let mut inline_pk_needs_desc = false;
+    if pk.len() == 1 {
+        let pk_col = pk[0];
+        if pk_col.ty.eq_ignore_ascii_case("INTEGER") {
+            match orig_sql
+                .as_deref()
+                .and_then(|sql| crate::pk_check::column_level_pk_is_desc(sql, &pk_col.name))
+            {
+                Some(true) => inline_pk_needs_desc = true,
+                Some(false) => {}
+                None => {
+                    return Err(MigrateError::Apply(format!(
+                        "cannot rebuild {table:?}: dropping {column:?} would leave \
+                         {:?} as the sole INTEGER PRIMARY KEY column, and {:?}'s original \
+                         ASC/DESC direction could not be read from {table:?}'s stored CREATE \
+                         TABLE. Reconstructing it as a bare PRIMARY KEY risks silently turning \
+                         it into SQLite's rowid alias, which changes what values it takes on a \
+                         future INSERT that omits it -- refusing rather than guessing.",
+                        pk_col.name, pk_col.name
+                    )));
+                }
+            }
+        }
+    }
+
     // Generated columns the rebuild can carry through, by name (#387).
     //
     // `table_info` cannot see them, so without this they are absent from `kept`,
@@ -703,8 +772,16 @@ fn rebuild_dropping_column(
             let mut def = c.render_def();
             if Some(c.name.as_str()) == inline_pk {
                 def.push_str(" PRIMARY KEY");
-                // AUTOINCREMENT is only legal on a single INTEGER rowid-alias PK.
-                if has_autoincrement && c.ty.eq_ignore_ascii_case("INTEGER") {
+                if inline_pk_needs_desc {
+                    // Preserves the DESC trap (#413): re-declaring DESC is
+                    // what keeps this column from becoming the rowid alias it
+                    // never was. AUTOINCREMENT is illegal on a DESC key (it
+                    // only exists on the rowid alias itself), so the two are
+                    // mutually exclusive by construction here.
+                    def.push_str(" DESC");
+                } else if has_autoincrement && c.ty.eq_ignore_ascii_case("INTEGER") {
+                    // AUTOINCREMENT is only legal on a single INTEGER
+                    // rowid-alias PK.
                     def.push_str(" AUTOINCREMENT");
                 }
             }
@@ -4253,6 +4330,91 @@ mod tests {
             assert_eq!(
                 seq_tables, 0,
                 "no AUTOINCREMENT wrongly synthesized on the drop-column rebuild"
+            );
+        }
+
+        #[test]
+        fn drop_column_rebuild_preserves_a_descending_primary_key() {
+            // #413: `code` is UNIQUE so dropping it forces the DDL-
+            // reconstructing rebuild, and the surviving single INTEGER PK
+            // column was declared DESC -- not the rowid alias. A rebuild that
+            // re-derives it as a bare ascending `PRIMARY KEY` would silently
+            // turn it into the alias it never was.
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, note TEXT, code TEXT UNIQUE);
+                 INSERT INTO t (id, note, code) VALUES (100, 'seeded', 'c1');",
+            )
+            .unwrap();
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(columns(&conn, "t"), vec!["id", "note"]);
+
+            // Direct proof: the seeded key (100, nowhere near any rowid
+            // SQLite would hand out) must not equal its own rowid.
+            let aliased: i64 = conn
+                .query_row("SELECT count(*) FROM t WHERE id = rowid", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(aliased, 0, "the DESC key must not equal its own rowid");
+
+            // The consequence of not being an alias: an INSERT that omits the
+            // key stores NULL rather than drawing a value from the rowid
+            // sequence.
+            conn.execute("INSERT INTO t (note) VALUES ('no key given')", [])
+                .unwrap();
+            let stored_null: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM t WHERE note = 'no key given' AND id IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stored_null, 1,
+                "an omitted DESC key must stay NULL, not draw a value from the rowid sequence"
+            );
+        }
+
+        #[test]
+        fn drop_column_rebuild_does_not_invent_desc_on_a_without_rowid_key() {
+            // Scope boundary (#413): a WITHOUT ROWID table's key has no rowid
+            // to be an alias of, so ASC/DESC there is ordinary index
+            // direction, not the alias question this fix answers. The
+            // rebuild (which already drops WITHOUT ROWID itself, warned, and
+            // unrelated to this fix) must not additionally invent a DESC the
+            // original never declared.
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE, note TEXT) \
+                 WITHOUT ROWID;
+                 INSERT INTO t (id, v, note) VALUES (1, 'c1', 'seeded');",
+            )
+            .unwrap();
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "v".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(columns(&conn, "t"), vec!["id", "note"]);
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='t'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                !sql.to_ascii_uppercase().contains("DESC"),
+                "a WITHOUT ROWID key's direction must not be changed by the rebuild: {sql}"
             );
         }
 

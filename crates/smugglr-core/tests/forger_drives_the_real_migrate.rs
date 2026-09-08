@@ -229,26 +229,72 @@ const REBUILD_FORCER: &str = "rebuild_forcer";
 /// `None` -- the pre-#387 behaviour -- fails `GeneratedVirtual` here, so the
 /// rebuild provably runs over these tables and the carry-through is what keeps
 /// them green.
-const REBUILT_TABLES: [&str; 4] = [
+///
+/// #413 widened this from four tables to every construct-bearing case table.
+/// `every_trait_schema()` unions 24 tables across the eight traits, and the
+/// four-table list put the real rebuild over three of those traits --
+/// `ForeignKeyWithAction`, `GeneratedVirtual`, `GeneratedStored` -- and only
+/// partially, since `ForeignKeyWithAction` alone carries seven referential
+/// actions across seven tables and only two were forced. The other five
+/// traits' constructs were only ever proven by the additive path above, or by
+/// forger's own from-scratch reconstruction, never by
+/// `rebuild_dropping_column` itself. The seven left out here are the FK
+/// case's plain parents (`keeper`, `updating_keeper`, `nulling_keeper`,
+/// `delete_nulling_keeper`, `delete_defaulting_keeper`, `defaulting_keeper`)
+/// and the trigger case's `audit`, none of which carry a construct of their
+/// own -- rebuilding a table with nothing on it proves nothing an already-
+/// green additive run had not.
+///
+/// `descending_key` is the one that matters most: before #413, forcing its
+/// rebuild made `DescendingPrimaryKey` fail with exactly the failure the issue
+/// quotes -- *"row(s) of descending_key.id equal their own rowid; that is the
+/// ascending spelling, which is the rowid alias"* -- because
+/// `rebuild_dropping_column` always re-derived a lone surviving `INTEGER` key
+/// column as a bare ascending `PRIMARY KEY`. It is the non-vacuity proof this
+/// widening exists to carry.
+const REBUILT_TABLES: [&str; 17] = [
     FK_TABLE,
+    "restrict_child",
     UPDATE_FK_TABLE,
+    "nulling_child",
+    "delete_nulling_child",
+    "delete_defaulting_child",
+    "defaulting_child",
     "virtual_generated",
     "stored_generated",
+    "replace_absorbs",
+    "ignore_absorbs",
+    "abort_throws",
+    "rollback_throws",
+    "expression_default",
+    "typeless",
+    "evented",
+    "descending_key",
 ];
 
-/// The rebuild reconstructs the referential actions it used to drop.
+/// The rebuild reconstructs the referential actions it used to drop, and --
+/// since [`REBUILT_TABLES`] (#413) -- every other construct the rebuild
+/// reconstructs, over the table that actually carries it.
 ///
 /// This is #341's red-to-green flip, and it is deliberately *not* asserting
 /// reconstructed DDL text: the defect produced a key that was present and
 /// inert, so `foreign_key_list` reporting a row proves nothing. What is asserted
 /// is that forger's probe -- which deletes a parent and moves a key and reads
-/// what happened to the children -- holds after the real engine rebuilt both
-/// tables.
+/// what happened to the children -- holds after the real engine rebuilt every
+/// construct-bearing table.
 ///
 /// Against the same wiring before the fix, `ForeignKeyWithAction` reported:
 /// *"deleting keeper.id = 1 was refused (FOREIGN KEY constraint failed), and a
 /// child declared ON DELETE CASCADE does not refuse it -- the action was
 /// reconstructed as something else, or dropped, which leaves NO ACTION"*.
+///
+/// `DescendingPrimaryKey` is #413's own red-to-green flip, measured the same
+/// way: against the pre-fix rebuild (`descending_key` in [`REBUILT_TABLES`]
+/// with `rebuild_dropping_column` always re-deriving a lone surviving
+/// `INTEGER` key column as an ascending `PRIMARY KEY`), the probe reported
+/// *"2 row(s) of descending_key.id equal their own rowid; that is the
+/// ascending spelling, which is the rowid alias -- INTEGER PRIMARY KEY DESC
+/// is not one and was seeded with keys no rowid sequence would produce"*.
 #[test]
 fn the_rebuild_path_preserves_the_referential_actions_it_reconstructs() {
     for backing in Backing::ALL {
@@ -292,6 +338,15 @@ fn the_rebuild_path_preserves_the_referential_actions_it_reconstructs() {
             "{backing:?}: the rebuild lost a referential action -- #341"
         );
 
+        // Named the same way for #413: the loop below would pass just as
+        // silently over a rebuild that had gone back to the ascending
+        // spelling as it would over one that never ran.
+        assert_eq!(
+            report.for_trait(Trait::DescendingPrimaryKey).transformed,
+            Outcome::Held,
+            "{backing:?}: the rebuild turned descending_key.id into the rowid alias -- #413"
+        );
+
         for observed in &report.traits {
             assert_eq!(
                 observed.transformed,
@@ -310,8 +365,8 @@ fn the_rebuild_path_preserves_the_referential_actions_it_reconstructs() {
     }
 }
 
-/// The every-trait schema with a `UNIQUE` column on each table carrying a
-/// referential action, so dropping it forces the rebuild.
+/// The every-trait schema with a `UNIQUE` column on each table in
+/// [`REBUILT_TABLES`], so dropping it forces the rebuild.
 ///
 /// `UNIQUE` rather than an index, because the column has to be refused by the
 /// direct `ALTER` and has to be droppable without taking a trait with it. It is
@@ -336,8 +391,8 @@ fn every_trait_schema_with_a_rebuild_forcer() -> Schema {
     start
 }
 
-/// Two `DROP COLUMN`s, each landing on a table whose foreign key carries an
-/// action, and each forced through the rebuild by the column being `UNIQUE`.
+/// One `DROP COLUMN` per [`REBUILT_TABLES`] entry, each forced through the
+/// rebuild by the column being `UNIQUE`.
 ///
 /// The target schema is `every_trait_schema()` itself rather than a third
 /// description: this migration removes exactly what

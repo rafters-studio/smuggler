@@ -289,6 +289,36 @@ pub fn classify_table_ddl(table: &str, ddl: &str) -> Vec<PkFinding> {
     findings
 }
 
+/// Whether `column` carries a column-level `PRIMARY KEY DESC` in `ddl`'s
+/// `CREATE TABLE` -- SQLite's DESC trap: `x INTEGER PRIMARY KEY DESC` is
+/// declared but is NOT the rowid alias, and `PRAGMA table_info` cannot see
+/// the direction, only the position. `None` when `ddl` cannot be parsed as a
+/// `CREATE TABLE` at all (a view, or malformed text): the caller must treat
+/// that as "cannot confirm either way", never as "not DESC".
+///
+/// Built for the `DROP COLUMN` rebuild (#413, `migrate::apply`), which
+/// re-derives a table's primary key from the *surviving* `PRAGMA table_info`
+/// rows and, for a lone surviving `INTEGER` key column, re-emits it as a bare
+/// `PRIMARY KEY` -- which IS the rowid alias. Asking this question rather
+/// than "was this column already the rowid alias"
+/// ([`ParsedTable::rowid_alias_column`]) is deliberate and narrower: that
+/// question answers "no" for two shapes this fix does not own --  a
+/// composite key's member (never had an ASC/DESC spelling of its own to
+/// preserve) and a `WITHOUT ROWID` table's key (no rowid to be an alias of,
+/// so ASC/DESC there is ordinary index direction, not the alias question at
+/// all) -- and re-declaring DESC on either would be a direction change this
+/// issue never asked for, in a case #413 has no test either side of. Reading
+/// `pk_desc` straight off the parsed column leaves both exactly as declared.
+pub(crate) fn column_level_pk_is_desc(ddl: &str, column: &str) -> Option<bool> {
+    let parsed = ParsedTable::parse(ddl)?;
+    Some(
+        parsed
+            .columns
+            .iter()
+            .any(|c| c.column_pk && c.pk_desc && c.name.eq_ignore_ascii_case(column)),
+    )
+}
+
 /// A PK column name looks derived-and-volatile.
 ///
 /// DDL cannot prove a value is re-derived (it is app-computed and stored in a
@@ -1113,6 +1143,104 @@ mod tests {
             "CREATE TABLE t (a TEXT NOT NULL, b TEXT NOT NULL, PRIMARY KEY (a, b))",
         );
         assert!(rowid_refusals(&findings).is_empty());
+    }
+
+    // --- column_level_pk_is_desc: the #413 rebuild's own question ------------
+
+    #[test]
+    fn column_level_pk_is_desc_true_only_for_the_desc_spelling() {
+        // The DESC trap itself: this is #413's exact question.
+        assert_eq!(
+            column_level_pk_is_desc("CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)", "id"),
+            Some(true)
+        );
+        // DESC is column-level, not the alias question: a non-INTEGER column
+        // can carry it too, and this function does not care about type --
+        // its caller does, gating on `ty.eq_ignore_ascii_case("INTEGER")`
+        // before ever asking. A TEXT column's DESC is ordinary index
+        // direction, never the rowid-alias hazard #413 fixes, so the
+        // rebuild leaves it exactly as `PRAGMA table_info` already did.
+        assert_eq!(
+            column_level_pk_is_desc("CREATE TABLE t (id TEXT PRIMARY KEY DESC, v TEXT)", "id"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn column_level_pk_is_desc_false_for_ascending_and_unrelated_columns() {
+        assert_eq!(
+            column_level_pk_is_desc("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", "id"),
+            Some(false)
+        );
+        assert_eq!(
+            column_level_pk_is_desc("CREATE TABLE t (id INTEGER PRIMARY KEY ASC, v TEXT)", "id"),
+            Some(false)
+        );
+        // A different column entirely.
+        assert_eq!(
+            column_level_pk_is_desc("CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)", "v"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn column_level_pk_is_desc_false_for_table_level_and_composite_forms() {
+        // Table-level `PRIMARY KEY(x)` -- even spelled `DESC` there -- is not
+        // this function's question: the DESC trap is a column-level-only
+        // quirk (see `rowid_alias_column`'s own doc), so a rebuild asking this
+        // function for a table-level key gets "not column-level DESC" and
+        // keeps re-deriving it exactly as it already did -- ascending, still
+        // the alias it already was.
+        assert_eq!(
+            column_level_pk_is_desc("CREATE TABLE t (x INTEGER, PRIMARY KEY(x))", "x"),
+            Some(false)
+        );
+        assert_eq!(
+            column_level_pk_is_desc("CREATE TABLE t (x INTEGER, PRIMARY KEY(x DESC))", "x"),
+            Some(false)
+        );
+        // A composite key's member was never declared with a column-level
+        // PRIMARY KEY at all, DESC or otherwise -- collapsing it to a lone
+        // survivor is out of this fix's scope (untested either direction), so
+        // this must not manufacture a DESC that was never declared.
+        assert_eq!(
+            column_level_pk_is_desc(
+                "CREATE TABLE t (a INTEGER NOT NULL, b TEXT NOT NULL, PRIMARY KEY (a, b))",
+                "a"
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn column_level_pk_is_desc_ignores_without_rowid() {
+        // A `WITHOUT ROWID` table's key has no rowid to be an alias of, so
+        // ASC/DESC there is ordinary index direction, not the alias question
+        // -- this function still reports exactly what was declared, in either
+        // direction, rather than treating "no rowid to alias" as "must be
+        // DESC".
+        assert_eq!(
+            column_level_pk_is_desc(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID",
+                "id"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            column_level_pk_is_desc(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT) WITHOUT ROWID",
+                "id"
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn column_level_pk_is_desc_none_when_the_ddl_does_not_parse() {
+        assert_eq!(
+            column_level_pk_is_desc("CREATE VIEW v AS SELECT 1", "id"),
+            None
+        );
     }
 
     #[test]
