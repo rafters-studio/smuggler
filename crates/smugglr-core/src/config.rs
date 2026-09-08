@@ -4,7 +4,7 @@ use crate::error::{Result, SyncError};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -557,8 +557,7 @@ impl DuplicatePkPolicy {
 /// into `newer_wins` on **both** peers, or apply your own last-write-wins at
 /// apply time (legion does the latter, and their tombstones converge because of
 /// their code, not because of this setting).
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
 pub enum ConflictResolution {
     /// Keep the local row. **Directional:** deterministic -- the remote row is
@@ -594,13 +593,52 @@ pub enum ConflictResolution {
     /// -- a mesh mixing this with `remote_wins` converges toward the permissive
     /// node.
     NewerWins,
-    /// UUIDv7 primary key with higher embedded timestamp wins.
-    /// Falls back to NewerWins when PKs are not valid UUIDv7.
+}
+
+impl ConflictResolution {
+    /// Parse a `conflict_resolution` string. The single canonical mapping,
+    /// shared by TOML config deserialization ([`Deserialize`] impl below) and
+    /// `smugglr-wasm`'s JS-facing config builder (`parse_conflict_resolution`)
+    /// -- so the host and wasm surfaces cannot drift the way wasm's
+    /// independently-maintained allowlist drifted before (#142).
     ///
-    /// Degenerates to [`ConflictResolution::NewerWins`] under `[broadcast]`: a
-    /// same-primary-key collision means both rows carry the *same* UUID, so the
-    /// key has nothing to break the tie with.
-    UuidV7Wins,
+    /// `"uuid_v7_wins"` is a deprecated alias for `"newer_wins"` (#431): the
+    /// variant never read a UUID. Every conflict path in this engine --
+    /// `classify_diff`'s intersection of local/remote primary keys, and
+    /// multicast's same-PK apply guard -- compares two rows that share one
+    /// *identical* primary key string; there is no second UUIDv7 key on the
+    /// other side to extract a timestamp from and compare against. So
+    /// `uuid_v7_wins` was `newer_wins` under a different name from the start,
+    /// not a missing feature. The alias stays for backward compatibility with
+    /// existing configs and warns once per config load.
+    pub fn parse_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "local_wins" => Ok(Self::LocalWins),
+            "remote_wins" => Ok(Self::RemoteWins),
+            "newer_wins" => Ok(Self::NewerWins),
+            "uuid_v7_wins" => {
+                warn!(
+                    "conflict_resolution = \"uuid_v7_wins\" is deprecated: it never compared a \
+                     UUIDv7 timestamp and has always behaved exactly like \"newer_wins\" (#431). \
+                     Treating it as \"newer_wins\" -- update the config to say so directly."
+                );
+                Ok(Self::NewerWins)
+            }
+            other => Err(format!(
+                "unknown conflict_resolution '{other}'; expected one of: local_wins, remote_wins, newer_wins"
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConflictResolution {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::parse_str(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Retry configuration for transient write failures.
@@ -1551,6 +1589,53 @@ converge_columns = ["email", "phone_*"]
         assert!(!column_excluded("name", converge));
         // The excluded pattern must not have leaked into the converge list.
         assert!(!column_excluded("title_embedding", converge));
+    }
+
+    // #431: `uuid_v7_wins` never read a UUID -- every conflict path compares
+    // two rows sharing one identical primary-key string, so there is no
+    // second key to extract a UUIDv7 timestamp from. The variant is removed;
+    // the string stays accepted as a deprecated alias for `newer_wins` so an
+    // existing config does not fail to load.
+    #[test]
+    fn test_parse_toml_uuid_v7_wins_is_a_deprecated_alias_for_newer_wins() {
+        let toml_str = r#"
+local_db = "game.db"
+
+[sync]
+conflict_resolution = "uuid_v7_wins"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.sync.conflict_resolution,
+            ConflictResolution::NewerWins
+        );
+    }
+
+    #[test]
+    fn parse_str_maps_uuid_v7_wins_to_newer_wins() {
+        assert_eq!(
+            ConflictResolution::parse_str("uuid_v7_wins"),
+            Ok(ConflictResolution::NewerWins)
+        );
+    }
+
+    #[test]
+    fn parse_str_rejects_unknown_conflict_resolution() {
+        let err = ConflictResolution::parse_str("remoteWins").unwrap_err();
+        assert!(err.contains("local_wins"));
+        assert!(err.contains("remote_wins"));
+        assert!(err.contains("newer_wins"));
+    }
+
+    #[test]
+    fn test_parse_toml_unknown_conflict_resolution_errors() {
+        let toml_str = r#"
+local_db = "game.db"
+
+[sync]
+conflict_resolution = "remoteWins"
+"#;
+        assert!(toml::from_str::<Config>(toml_str).is_err());
     }
 
     // Absent from the config, converge_columns defaults empty, which is what

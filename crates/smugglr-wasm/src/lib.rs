@@ -277,16 +277,15 @@ struct JsTableDiff {
 
 fn parse_conflict_resolution(s: Option<&str>) -> Result<ConflictResolution, JsValue> {
     match s {
-        None | Some("local_wins") => Ok(ConflictResolution::LocalWins),
-        Some("remote_wins") => Ok(ConflictResolution::RemoteWins),
-        Some("newer_wins") => Ok(ConflictResolution::NewerWins),
-        Some("uuid_v7_wins") => Ok(ConflictResolution::UuidV7Wins),
-        // Reject unknown values loudly: silently defaulting to LocalWins would
-        // sync the wrong direction (data-loss-shaped) on a typo like "remoteWins".
-        Some(other) => Err(JsValue::from_str(&format!(
-            "unknown conflict_resolution '{}'; expected one of: local_wins, remote_wins, newer_wins, uuid_v7_wins",
-            other
-        ))),
+        None => Ok(ConflictResolution::LocalWins),
+        // Delegate to the one canonical mapping (`ConflictResolution::parse_str`)
+        // instead of keeping a second, independently-maintained allowlist here --
+        // the two drifted before (#142 fell back to `local_wins` silently; this
+        // crate carried its own `uuid_v7_wins` arm long after core's meaning of
+        // it changed, #431). Reject unknown values loudly: silently defaulting
+        // to LocalWins would sync the wrong direction (data-loss-shaped) on a
+        // typo like "remoteWins".
+        Some(s) => ConflictResolution::parse_str(s).map_err(|e| JsValue::from_str(&e)),
     }
 }
 

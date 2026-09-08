@@ -90,9 +90,8 @@ pub struct BroadcastConfig {
     /// convergence break shipped as a bugfix. `remote_wins` here preserves the
     /// historical semantics exactly; `newer_wins` is an explicit opt-in.
     ///
-    /// `uuid_v7_wins` degenerates to `newer_wins` on this path: a same-PK
-    /// collision means the two rows carry the *same* UUID, so the PK cannot
-    /// break the tie.
+    /// `"uuid_v7_wins"` is accepted here too, as a deprecated alias for
+    /// `"newer_wins"` -- see [`ConflictResolution::parse_str`] (#431).
     #[serde(default = "default_broadcast_conflict_resolution")]
     pub conflict_resolution: ConflictResolution,
 
