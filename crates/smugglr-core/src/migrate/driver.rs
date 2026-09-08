@@ -25,16 +25,21 @@
 //! ```
 //!
 //! Everything from `try_elect` through the settling `mark_success` /
-//! `mark_failed` (below) is [`elect_apply_settle`]'s skeleton, not repeated
-//! here inline. It has exactly two callers: [`apply_migration`], and
+//! `mark_failed` (below) is [`elect_apply_settle`](crate::migrate::driver::elect_apply_settle)'s
+//! skeleton, not repeated here inline. It has exactly two callers:
+//! [`apply_migration`](crate::migrate::driver::apply_migration), and
 //! [`apply_compensating`](crate::migrate::reverse::apply_compensating) in
 //! `reverse.rs`, which supplies its own `run` (`down_ops` / pre-image
 //! restore) and none of the guards above -- see that function's own doc for
 //! why each guard is not carried over (#463). That is what makes "there must
 //! never be a second forward-apply loop" (below) true of the code and not
-//! only the doc: the guards live once, in `apply_migration`; the
-//! claim-run-settle skeleton lives once, in `elect_apply_settle`; and
-//! `reverse.rs` composes the skeleton rather than reimplementing it.
+//! only the doc: the guards that only apply to a full authored manifest
+//! (checksum verification, ensure-schema, the already-applied check, and the
+//! #427 refusal) live once, before `apply_migration` calls
+//! `elect_apply_settle`; the manifest-level lint gates run once, inside the
+//! `run` closure `apply_migration` passes it; and the claim-run-settle
+//! skeleton itself lives once, in `elect_apply_settle`, with `reverse.rs`
+//! composing it rather than reimplementing it.
 //!
 //! ## The ledger write is two-phase, and election runs BEFORE apply
 //!
@@ -66,7 +71,8 @@
 //! programmatic embedder API **on** [`apply_migration`] rather than beside it.
 //! There must never be a second forward-apply loop -- and as of #463 that is
 //! enforced by extraction, not merely stated: the one claim-run-settle
-//! skeleton is [`elect_apply_settle`], [`apply_migration`] is its first
+//! skeleton is [`elect_apply_settle`](crate::migrate::driver::elect_apply_settle),
+//! [`apply_migration`](crate::migrate::driver::apply_migration) is its first
 //! caller, and [`apply_compensating`](crate::migrate::reverse::apply_compensating)
 //! is its second. A future third caller (#291's embedder, or a CLI wired
 //! onto reverse) composes the same skeleton rather than hand-rolling another
@@ -186,25 +192,33 @@ pub fn apply_migration_to_file(
 /// crash lands somewhere the ledger already describes.
 ///
 /// This function is deliberately **not** where the guards that only make
-/// sense for a full authored manifest live: checksum verification
-/// ([`ChecksummedManifest::verify`]), [`Ledger::ensure_schema`], the
-/// `applied_version_of` already-applied short-circuit, the #427 rowid-alias
-/// refusal, or [`lint::lint_manifest`] / [`lint::enforce_preimage`].
-/// [`apply_migration`] runs all of those *before* calling this function,
-/// exactly as it did before this extraction.
+/// sense for a full authored manifest live. Two different timings, both
+/// outside this function's body:
+///
+/// - Checksum verification ([`ChecksummedManifest::verify`]),
+///   [`Ledger::ensure_schema`], the `applied_version_of` already-applied
+///   short-circuit, and the #427 rowid-alias refusal all run *before*
+///   [`apply_migration`] ever calls this function -- claiming a version is
+///   pointless if any of them is going to refuse.
+/// - [`lint::lint_manifest`] / [`lint::enforce_preimage`] run *inside* the
+///   `run` closure [`apply_migration`] passes here, after election succeeds,
+///   exactly where they ran before this extraction -- they are manifest-level
+///   gates, not pre-election ones, and moving them earlier would lint a
+///   manifest before knowing whether this call even wins the election.
+///
 /// [`apply_compensating`](crate::migrate::reverse::apply_compensating) does
-/// not run them at all, and that omission predates this extraction and is
-/// deliberate, not an oversight this function should paper over: `down_ops`
-/// are the structural inverse of `up` ops that already passed lint when they
-/// applied forward, or a captured pre-image restore -- neither is fresh
-/// user-authored DDL, so re-running manifest-level gates on them is a
-/// separate design question (see that function's own doc for the reasoning,
-/// and #463's PR body for why each guard was or was not carried over).
+/// not run any of the above at all, and that omission predates this
+/// extraction and is deliberate, not an oversight this function should paper
+/// over: `down_ops` are the structural inverse of `up` ops that already
+/// passed lint when they applied forward, or a captured pre-image restore --
+/// neither is fresh user-authored DDL, so re-running manifest-level gates on
+/// them is a separate design question (see that function's own doc for the
+/// reasoning, and #463's PR body for why each guard was or was not carried
+/// over).
 ///
 /// Returns `(election, None)` when the election was not [`Election::Won`] --
 /// `run` never executes and nothing was mutated. Returns
 /// `(Election::Won, Some(value))` when `run` returned `Ok(value)`.
-#[cfg(feature = "native")]
 pub(crate) fn elect_apply_settle<T>(
     conn: &Connection,
     version: u64,

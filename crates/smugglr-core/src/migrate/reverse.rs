@@ -886,7 +886,8 @@ pub async fn load_preimage(
 /// row a 0.5.0 apply produces. The ledger exposes no setter for the column -- it
 /// appears in `ledger.rs`'s `CREATE TABLE` and in the `SELECT` projections, and in
 /// no write path: the election insert does not list it, so every row is born NULL,
-/// and none of [`Ledger::mark_success`], [`Ledger::mark_failed`], or either lease
+/// and none of [`Ledger::mark_success`](crate::migrate::ledger::Ledger::mark_success),
+/// [`Ledger::mark_failed`](crate::migrate::ledger::Ledger::mark_failed), or either lease
 /// reclaim touches it afterwards. The forward driver (#296) returns the
 /// captured payload in its apply outcome instead of stashing a key on the row.
 /// Until some component takes ownership of writing it, a `Ref` pre-image reaches a
@@ -933,12 +934,16 @@ pub fn preimage_ref_of(entry: &LedgerEntry) -> Option<Preimage> {
 ///
 /// # No manifest-level guards run here, deliberately (#463)
 ///
-/// `apply_migration` runs five guards before it ever elects a version:
-/// checksum verification, the `applied_version_of` already-applied
-/// short-circuit, `lint::lint_manifest`, `lint::enforce_preimage`, and the
-/// #427 rowid-alias refusal. This function runs none of them, and that is not
-/// an oversight this issue's extraction papers over -- each was checked
-/// against what a reverse actually is and rejected on its own terms:
+/// `apply_migration` runs five guards against a full authored manifest:
+/// checksum verification and the `applied_version_of` already-applied
+/// short-circuit and the #427 rowid-alias refusal, all *before* it ever
+/// elects a version, plus `lint::lint_manifest` / `lint::enforce_preimage`,
+/// which run *after* election succeeds (inside the closure
+/// [`elect_apply_settle`](crate::migrate::driver::elect_apply_settle) calls,
+/// unchanged from before this extraction). This function runs none of the
+/// five, at either timing, and that is not an oversight this issue's
+/// extraction papers over -- each was checked against what a reverse
+/// actually is and rejected on its own terms:
 ///
 /// - **Checksum verification** verifies a [`ChecksummedManifest`](crate::migrate::ChecksummedManifest)
 ///   travelling as a sealed unit; `down_ops` and `payload` are not a sealed
@@ -2150,10 +2155,10 @@ mod tests {
             ))
             .unwrap();
 
-            let res = apply_compensating(&conn, 9, "c9", &[], None, 300);
+            let err = apply_compensating(&conn, 9, "c9", &[], None, 300).unwrap_err();
             assert!(
-                res.is_err(),
-                "the poisoned mark_success must surface as an error, not succeed silently"
+                err.to_string().contains("forced mark_success failure"),
+                "the poisoned mark_success's own error must surface, not a different one: {err}"
             );
 
             let entry = Ledger::entry(&conn, 9).unwrap().unwrap();
