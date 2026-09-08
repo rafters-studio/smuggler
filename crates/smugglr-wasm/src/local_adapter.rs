@@ -107,26 +107,39 @@ impl LocalSqlDataSource {
         }
 
         let column_order: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
-        let sql =
-            adapter_common::incremental_metadata_sql(table, &info.primary_key, timestamp_column);
+        let sql = smugglr_core::http_sql::incremental_metadata_sql(
+            table,
+            &info.primary_key,
+            timestamp_column,
+        );
         let params = vec![Value::String(since_timestamp.to_string())];
         let result = self.run(&sql, &params).await?;
         let mut maps = adapter_common::rows_to_maps(&result.columns, &result.rows);
-        adapter_common::canonicalize_json_blobs(&mut maps, &info);
+        for w in smugglr_core::http_sql::canonicalize_json_blobs(&mut maps, &info) {
+            web_sys::console::warn_1(&format!("smugglr: {}", w).into());
+        }
 
-        adapter_common::row_maps_to_metadata(
+        let (meta, warnings) = smugglr_core::http_sql::row_maps_to_metadata(
             &maps,
             &column_order,
             timestamp_column,
             exclude_columns,
             table,
             DuplicatePkPolicy::default(),
-        )
+        )?;
+        for w in warnings {
+            web_sys::console::warn_1(&format!("smugglr: {}", w).into());
+        }
+        Ok(meta)
     }
 
     async fn cached_table_info(&self, table: &str) -> Result<TableInfo> {
-        adapter_common::cached_table_info(&self.table_info_cache, table, self.table_info(table))
-            .await
+        smugglr_core::http_sql::cached_table_info(
+            &self.table_info_cache,
+            table,
+            self.table_info(table),
+        )
+        .await
     }
 }
 
@@ -159,7 +172,7 @@ impl DataSource for LocalSqlDataSource {
         let result = self
             .run(&format!("PRAGMA table_info('{}')", table), &[])
             .await?;
-        Ok(adapter_common::parse_table_info(
+        Ok(smugglr_core::http_sql::parse_table_info(
             table,
             &result.columns,
             &result.rows,
@@ -185,16 +198,22 @@ impl DataSource for LocalSqlDataSource {
         let sql = format!("SELECT *, {} AS __pk FROM \"{}\"", pk_expr, table);
         let result = self.run(&sql, &[]).await?;
         let mut maps = adapter_common::rows_to_maps(&result.columns, &result.rows);
-        adapter_common::canonicalize_json_blobs(&mut maps, &info);
+        for w in smugglr_core::http_sql::canonicalize_json_blobs(&mut maps, &info) {
+            web_sys::console::warn_1(&format!("smugglr: {}", w).into());
+        }
 
-        adapter_common::row_maps_to_metadata(
+        let (meta, warnings) = smugglr_core::http_sql::row_maps_to_metadata(
             &maps,
             &column_order,
             timestamp_column,
             exclude_columns,
             table,
             DuplicatePkPolicy::default(),
-        )
+        )?;
+        for w in warnings {
+            web_sys::console::warn_1(&format!("smugglr: {}", w).into());
+        }
+        Ok(meta)
     }
 
     async fn get_rows(

@@ -14,6 +14,7 @@ pub mod config;
 pub mod datasource;
 pub mod diff;
 pub mod error;
+pub mod http_sql;
 pub mod migrate;
 pub mod pk_check;
 pub mod profile;
