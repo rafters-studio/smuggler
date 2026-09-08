@@ -455,6 +455,36 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Create a WAL-mode test database with `row_count` rows in `items`, and
+    /// return the still-open connection. Both #433 WAL regression tests need
+    /// the writer kept open through the `snapshot()` call so SQLite's
+    /// close-time auto-checkpoint cannot quietly merge the WAL and hide the
+    /// bug being tested -- returning the live connection (instead of
+    /// dropping it here) is what makes that possible.
+    fn create_wal_test_db(path: &Path, row_count: i64) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal", "journal_mode must be WAL");
+        conn.execute_batch(
+            "CREATE TABLE items (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                updated_at TEXT
+            )",
+        )
+        .unwrap();
+        for i in 1..=row_count {
+            conn.execute(
+                "INSERT INTO items (id, name, updated_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![i, format!("item-{}", i), "2024-01-01"],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
     #[tokio::test]
     async fn test_snapshot_creates_files() {
         let dir = TempDir::new().unwrap();
@@ -605,26 +635,7 @@ mod tests {
         let snap_dir = dir.path().join("snap_store");
         std::fs::create_dir_all(&snap_dir).unwrap();
 
-        let conn = Connection::open(&local_path).unwrap();
-        let mode: String = conn
-            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(mode.to_lowercase(), "wal", "journal_mode must be WAL");
-        conn.execute_batch(
-            "CREATE TABLE items (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                updated_at TEXT
-            )",
-        )
-        .unwrap();
-        for i in 1..=25i64 {
-            conn.execute(
-                "INSERT INTO items (id, name, updated_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![i, format!("item-{}", i), "2024-01-01"],
-            )
-            .unwrap();
-        }
+        let conn = create_wal_test_db(&local_path, 25);
 
         // Confirm the WAL sidecar actually holds uncheckpointed bytes --
         // otherwise this test would not be exercising the bug at all.
@@ -728,26 +739,7 @@ mod tests {
         let snap_dir = dir.path().join("snap_store");
         std::fs::create_dir_all(&snap_dir).unwrap();
 
-        let conn = Connection::open(&local_path).unwrap();
-        let mode: String = conn
-            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(mode.to_lowercase(), "wal", "journal_mode must be WAL");
-        conn.execute_batch(
-            "CREATE TABLE items (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                updated_at TEXT
-            )",
-        )
-        .unwrap();
-        for i in 1..=25i64 {
-            conn.execute(
-                "INSERT INTO items (id, name, updated_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![i, format!("item-{}", i), "2024-01-01"],
-            )
-            .unwrap();
-        }
+        let conn = create_wal_test_db(&local_path, 25);
 
         let config = make_file_stash_config(&snap_dir);
         let snap_result = snapshot(&config, local_path.to_str().unwrap(), false)
