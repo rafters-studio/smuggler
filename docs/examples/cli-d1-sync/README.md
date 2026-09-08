@@ -2,15 +2,13 @@
 
 Sync a local SQLite database with a Cloudflare D1 database from the command line.
 
-## Read this first: 0.5.0 cannot complete this example
+## Read this first: no output blocks, because nobody has run it against real D1
 
-Two defects in the 0.5.0 release stop this example before the first request, and this README will not show you output it could not produce.
+The two defects that used to stop this example before the first request are both fixed. The release now ships `smugglr-http-sql` alongside `smugglr` (#430), and the `[target] type = "d1"` shape below resolves to Cloudflare's own D1 query endpoint and sends the token as a bearer credential (#429), both covered by tests that drive the documented config into a capture endpoint and assert the URL and the `Authorization` header.
 
-The release ships one binary, `smugglr`, but every remote target is reached through a second one, `smugglr-http-sql`, which neither the installer nor `cargo install smugglr` provides (#430). Without it every command below stops with `d1 target requires the smugglr-http-sql plugin`. `cargo install smugglr-http-sql` installs it from crates.io.
+What is still missing is a run. Every other example here carries output pasted from a real invocation; this one carries none, because reaching D1 needs a Cloudflare account, a database, and a token, and no one has run it end to end since the fix. Treat the commands as correct and the absence of output as what it is -- untested against the live service, not verified and omitted.
 
-With the plugin present, the `[target] type = "d1"` shape still fails: the core hands the plugin `account_id`, `database_id`, and `api_token`, but the plugin needs a `url` and reads the token from a different key, and nothing builds the D1 query URL from the ids (#429). The result is `missing config: url`, or a request with no authorization header. This has been true since 0.4.0.
-
-Until #429 and #430 land, the config below is the shape the fix will honor, and the commands are the ones that will run. The output blocks are absent on purpose. If you need D1 today, [node-server-to-d1](../node-server-to-d1/) builds the URL itself and works with the npm package.
+If you want D1 with captured output today, [node-server-to-d1](../node-server-to-d1/) builds the URL itself and works with the npm package.
 
 ## Prerequisites
 

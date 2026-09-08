@@ -122,6 +122,9 @@ backoff_multiplier = 2.0
 # =============================================================================
 # Durable Objects Bridge
 # =============================================================================
+# A d1 target with no `url` goes to Cloudflare's own D1 query endpoint, built
+# from account_id and database_id. Set `url` to send it somewhere else instead.
+#
 # To sync with a Cloudflare Durable Object's SQLite storage, deploy the
 # DO bridge template (templates/do-bridge/) and point at it with a custom URL:
 #
