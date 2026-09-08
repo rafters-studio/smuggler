@@ -164,6 +164,11 @@ impl DataSource for LocalDb {
         let count: usize = conn.query_row(&sql, [], |row| row.get(0))?;
         Ok(count)
     }
+
+    async fn foreign_key_parents(&self, table: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        foreign_key_parents_inner(&conn, table)
+    }
 }
 
 // -- Internal functions that operate on a borrowed Connection --
@@ -182,6 +187,22 @@ fn list_tables_inner(conn: &Connection) -> Result<Vec<String>> {
 
     debug!("Found {} tables", tables.len());
     Ok(tables)
+}
+
+/// Parent tables `table` references, read straight from SQLite's own
+/// dependency tracking (`PRAGMA foreign_key_list`) rather than parsed out of
+/// the DDL text. Column 2 of each returned row is the referenced table name;
+/// a composite foreign key spanning several columns to the same parent
+/// produces one row per column, so callers that need a deduplicated edge set
+/// (`sync::topological_table_order`) dedupe on their side.
+///
+/// Works on a read-only connection: it is a read-only pragma, not a write.
+fn foreign_key_parents_inner(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA foreign_key_list(\"{}\")", table))?;
+    let parents: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(2))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(parents)
 }
 
 fn table_info_inner(conn: &Connection, table: &str) -> Result<TableInfo> {

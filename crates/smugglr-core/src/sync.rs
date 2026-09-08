@@ -30,7 +30,7 @@ impl DiffDetail {
         }
     }
 }
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use tracing::{info, warn};
 
 /// Trait for reporting sync progress to the UI layer.
@@ -386,16 +386,16 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
     })
 }
 
-/// Get list of tables to sync based on config
+/// Get list of tables to sync based on config, ordered so a parent table
+/// (referenced by a `FOREIGN KEY`) is always written before the tables that
+/// reference it -- see [`topological_table_order`].
 pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
     local: &A,
     remote: &B,
     config: &Config,
 ) -> Result<Vec<String>> {
-    let local_tables: std::collections::HashSet<_> =
-        local.list_tables().await?.into_iter().collect();
-    let remote_tables: std::collections::HashSet<_> =
-        remote.list_tables().await?.into_iter().collect();
+    let local_tables: HashSet<_> = local.list_tables().await?.into_iter().collect();
+    let remote_tables: HashSet<_> = remote.list_tables().await?.into_iter().collect();
 
     let common: Vec<String> = local_tables
         .intersection(&remote_tables)
@@ -443,8 +443,155 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
     remote_all.sort();
     check_table_set(&config.sync.tables, &local_all, &remote_all, &syncable)?;
 
-    info!("Found {} tables to sync", syncable.len());
-    Ok(syncable)
+    // `local` is the one side guaranteed to be a real SQLite database (the
+    // CLI always passes the local db here, on push, pull, and sync alike --
+    // see `get_tables_to_sync`'s callers in `run_directional`/`sync_all`), so
+    // it is the only side whose foreign-key graph is introspectable via
+    // `PRAGMA foreign_key_list`. Both directions want the same order from it:
+    // on push, parents must exist on the remote before children are written
+    // there; on pull, parents must exist locally before children are written
+    // here. Since source and destination share one schema, one graph -- read
+    // from `local` -- serves both. A source that cannot introspect (a plugin
+    // target, a non-SQLite `DataSource`) returns no parents by default, which
+    // leaves the order at its alphabetical tiebreak, unchanged from before
+    // this method existed.
+    //
+    // A `LocalDb` failure here is propagated, not warned-and-skipped: `table`
+    // came from `list_tables()` and already passed `table_info()` above, so
+    // it exists, and `PRAGMA foreign_key_list` on a table that exists should
+    // not fail in ordinary operation. Silently treating a read failure as
+    // "no parents" would quietly hand back exactly the unordered, FK-unsafe
+    // write order this function exists to replace, with only a log line as
+    // evidence -- worse than surfacing it now, since the alternative is the
+    // operator discovering it later as a write-time FOREIGN KEY constraint
+    // failure with no obvious connection to its real cause.
+    let mut parents_of: HashMap<String, Vec<String>> = HashMap::new();
+    for table in &syncable {
+        let parents = local.foreign_key_parents(table).await?;
+        parents_of.insert(table.clone(), parents);
+    }
+    let (ordered, cyclic) = topological_table_order(&syncable, &parents_of);
+    if !cyclic.is_empty() {
+        warn!(
+            "Foreign-key references among tables {:?} form a cycle; falling back to alphabetical write order",
+            cyclic
+        );
+    }
+
+    info!("Found {} tables to sync", ordered.len());
+    Ok(ordered)
+}
+
+/// Order `tables` so a parent table (referenced by another table's `FOREIGN
+/// KEY`) always precedes every table that references it, with alphabetical
+/// order breaking every other choice -- both among tables with no dependency
+/// relationship (so a schema with no foreign keys sorts exactly as before
+/// this function existed) and, on a cycle, for the whole set.
+///
+/// `parents_of` maps each table to the tables it directly references, as
+/// returned by [`DataSource::foreign_key_parents`]. An entry naming a table
+/// outside `tables` (its other side is not part of this sync run) or naming
+/// the table itself (a self-reference -- out of scope; see #435's "Out of
+/// scope", it relies on the target deferring or disabling enforcement) is
+/// ignored, so neither can create or break an edge.
+///
+/// Returns the ordered tables and, only when a cycle prevented a full
+/// topological order, the names of the tables the cycle left unplaced -- in
+/// which case the returned order is the plain alphabetical order over all of
+/// `tables`, and the caller is expected to log one warning naming those
+/// tables (this function has no logging dependency, so it stays a pure,
+/// directly testable sort).
+///
+/// `tables` may contain duplicate names without corrupting the result: a
+/// repeated name is deduplicated up front and appears once in the returned
+/// order. (`get_tables_to_sync`'s `syncable`, the only caller today, is
+/// already duplicate-free -- it comes from a `HashSet` intersection -- but
+/// this function is pure and separately tested, so a future caller does not
+/// inherit that as an undocumented precondition: without the dedup, a
+/// repeated name would collapse to one `indegree` entry while `tables.len()`
+/// still counted both copies, so the order-complete check below would never
+/// see `order.len() == tables.len()` and every call would report a false
+/// cycle naming the duplicate.)
+fn topological_table_order(
+    tables: &[String],
+    parents_of: &HashMap<String, Vec<String>>,
+) -> (Vec<String>, Vec<String>) {
+    let mut tables_seen: HashSet<&str> = HashSet::with_capacity(tables.len());
+    let tables: Vec<&str> = tables
+        .iter()
+        .map(String::as_str)
+        .filter(|t| tables_seen.insert(*t))
+        .collect();
+    let tables = tables.as_slice();
+
+    let table_set: HashSet<&str> = tables.iter().copied().collect();
+
+    // in-degree = number of (in-set, non-self) parents a table still has left
+    // to place; `dependents` is the reverse edge, parent -> its children.
+    let mut indegree: HashMap<&str, usize> = tables.iter().map(|&t| (t, 0)).collect();
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for &table in tables {
+        let Some(parents) = parents_of.get(table) else {
+            continue;
+        };
+        let mut seen: HashSet<&str> = HashSet::new();
+        for parent in parents {
+            let parent = parent.as_str();
+            if parent == table || !table_set.contains(parent) || !seen.insert(parent) {
+                // Self-reference (out of scope), a parent outside this sync
+                // run, or a duplicate edge from a multi-column foreign key to
+                // the same parent -- none of these add a new ordering constraint.
+                continue;
+            }
+            *indegree.entry(table).or_insert(0) += 1;
+            dependents.entry(parent).or_default().push(table);
+        }
+    }
+
+    // Kahn's algorithm: repeatedly take the alphabetically-first table with
+    // no remaining unplaced parent. `BTreeSet` keeps the ready set ordered so
+    // the tiebreak falls out of `pop_first` instead of a separate sort.
+    let mut ready: BTreeSet<&str> = indegree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&t, _)| t)
+        .collect();
+    let mut order: Vec<&str> = Vec::with_capacity(tables.len());
+
+    while let Some(next) = ready.pop_first() {
+        order.push(next);
+        if let Some(deps) = dependents.get(next) {
+            for &dep in deps {
+                if let Some(remaining) = indegree.get_mut(dep) {
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        ready.insert(dep);
+                    }
+                }
+            }
+        }
+    }
+
+    if order.len() == tables.len() {
+        return (order.into_iter().map(str::to_string).collect(), Vec::new());
+    }
+
+    // A cycle left some tables permanently at indegree > 0: fall back to
+    // alphabetical for the whole set, and report just the tables the cycle
+    // caught (the ones `order` never reached) so the warning names the actual
+    // culprits rather than every synced table.
+    let placed: HashSet<&str> = order.into_iter().collect();
+    let mut cyclic: Vec<String> = tables
+        .iter()
+        .filter(|&&t| !placed.contains(t))
+        .map(|t| t.to_string())
+        .collect();
+    cyclic.sort();
+
+    let mut fallback: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
+    fallback.sort();
+    (fallback, cyclic)
 }
 
 /// Refuse a table set that would make a run report success while moving
@@ -692,6 +839,239 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Build a `parents_of` map from `(table, parents)` pairs, the shape
+    /// `topological_table_order` consumes.
+    fn parents(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(t, p)| (t.to_string(), p.iter().map(|x| x.to_string()).collect()))
+            .collect()
+    }
+
+    mod topo_order {
+        use super::*;
+
+        #[test]
+        fn a_schema_with_no_foreign_keys_sorts_alphabetically() {
+            let tables = s(&["zebra", "apple", "mango"]);
+            let (order, cyclic) = topological_table_order(&tables, &HashMap::new());
+            assert_eq!(order, s(&["apple", "mango", "zebra"]));
+            assert!(cyclic.is_empty());
+        }
+
+        #[test]
+        fn a_child_lands_after_its_parent_even_though_it_sorts_first() {
+            // "order_details" < "orders" alphabetically, but order_details
+            // references orders, so orders must come first -- the exact
+            // Westwind shape #435 names.
+            let tables = s(&["customers", "order_details", "orders"]);
+            let fks = parents(&[("orders", &["customers"]), ("order_details", &["orders"])]);
+            let (order, cyclic) = topological_table_order(&tables, &fks);
+            assert_eq!(order, s(&["customers", "orders", "order_details"]));
+            assert!(cyclic.is_empty());
+        }
+
+        #[test]
+        fn ties_among_independent_tables_break_alphabetically() {
+            // Both "b" and "c" depend only on "a"; among tables with no
+            // remaining dependency the alphabetically-first one goes next.
+            let tables = s(&["c", "b", "a"]);
+            let fks = parents(&[("b", &["a"]), ("c", &["a"])]);
+            let (order, _) = topological_table_order(&tables, &fks);
+            assert_eq!(order, s(&["a", "b", "c"]));
+        }
+
+        #[test]
+        fn a_self_reference_is_not_a_cycle() {
+            // employees.reports_to -> employees: out of scope per #435, must
+            // not trip the cycle fallback for the whole set.
+            let tables = s(&["departments", "employees"]);
+            let fks = parents(&[("employees", &["departments", "employees"])]);
+            let (order, cyclic) = topological_table_order(&tables, &fks);
+            assert_eq!(order, s(&["departments", "employees"]));
+            assert!(cyclic.is_empty());
+        }
+
+        #[test]
+        fn a_parent_outside_the_synced_set_adds_no_constraint() {
+            // "orders" references "customers", but customers is not in this
+            // sync run (e.g. filtered out, or missing a primary key) -- no
+            // edge, so order alone still just sorts alphabetically.
+            let tables = s(&["orders"]);
+            let fks = parents(&[("orders", &["customers"])]);
+            let (order, cyclic) = topological_table_order(&tables, &fks);
+            assert_eq!(order, s(&["orders"]));
+            assert!(cyclic.is_empty());
+        }
+
+        #[test]
+        fn a_cycle_falls_back_to_alphabetical_and_names_the_cycle() {
+            let tables = s(&["a", "b", "unrelated"]);
+            let fks = parents(&[("a", &["b"]), ("b", &["a"])]);
+            let (order, cyclic) = topological_table_order(&tables, &fks);
+            assert_eq!(
+                order,
+                s(&["a", "b", "unrelated"]),
+                "whole set, alphabetical"
+            );
+            assert_eq!(cyclic, s(&["a", "b"]), "names only the cyclic tables");
+        }
+
+        #[test]
+        fn a_multi_column_foreign_key_to_one_parent_is_one_edge() {
+            // Two columns of "line_items" each reference "orders"; that must
+            // not double-count as two constraints or otherwise misbehave.
+            let tables = s(&["line_items", "orders"]);
+            let fks = parents(&[("line_items", &["orders", "orders"])]);
+            let (order, cyclic) = topological_table_order(&tables, &fks);
+            assert_eq!(order, s(&["orders", "line_items"]));
+            assert!(cyclic.is_empty());
+        }
+
+        #[test]
+        fn a_duplicate_table_name_in_the_input_does_not_manufacture_a_false_cycle() {
+            // Review finding (#448): `indegree` collapses a repeated name to
+            // one entry while the old `tables.len()` still counted both
+            // copies, so `order.len() == tables.len()` could never hold and
+            // every call would misreport a cycle naming the duplicate. The
+            // function now deduplicates its input up front instead of relying
+            // on every caller to pass an already-unique list.
+            let tables = s(&["orders", "orders", "customers"]);
+            let fks = parents(&[("orders", &["customers"])]);
+            let (order, cyclic) = topological_table_order(&tables, &fks);
+            assert_eq!(
+                order,
+                s(&["customers", "orders"]),
+                "the duplicate collapses"
+            );
+            assert!(cyclic.is_empty(), "not a cycle: {cyclic:?}");
+        }
+    }
+
+    // Review finding (#448, round 2): the dedup fix above got its own
+    // regression test, but the sibling fix in the same commit -- an
+    // unreadable `foreign_key_parents` now propagates via `?` instead of
+    // being warn!-logged and silently treated as "this table has no
+    // parents" -- had none. Nothing failed if a future edit quietly
+    // softened that back to `.ok()`/`unwrap_or_default()`, which would
+    // reintroduce exactly the unordered, FK-unsafe write order this whole
+    // change exists to replace, with no test signal. This pins it.
+    #[cfg(feature = "native")]
+    mod fk_error_propagation {
+        use super::super::get_tables_to_sync;
+        use crate::config::Config;
+        use crate::datasource::{DataSource, RowMeta, TableInfo};
+        use crate::error::{Result, SyncError};
+        use serde_json::Value;
+        use std::collections::HashMap;
+
+        /// A local side with one syncable table whose `foreign_key_parents`
+        /// always fails, simulating a `PRAGMA foreign_key_list` read that
+        /// errors on a table `list_tables`/`table_info` both already
+        /// confirmed exists.
+        struct FkErrorLocal;
+
+        impl DataSource for FkErrorLocal {
+            async fn list_tables(&self) -> Result<Vec<String>> {
+                Ok(vec!["orders".to_string()])
+            }
+            async fn table_info(&self, _table: &str) -> Result<TableInfo> {
+                Ok(TableInfo {
+                    name: "orders".to_string(),
+                    columns: vec![],
+                    primary_key: vec!["id".to_string()],
+                })
+            }
+            async fn get_row_metadata(
+                &self,
+                _table: &str,
+                _timestamp_column: &str,
+                _exclude_columns: &[String],
+            ) -> Result<HashMap<String, RowMeta>> {
+                Ok(HashMap::new())
+            }
+            async fn get_rows(
+                &self,
+                _table: &str,
+                _pk_values: &[String],
+            ) -> Result<Vec<HashMap<String, Value>>> {
+                Ok(vec![])
+            }
+            async fn upsert_rows(
+                &self,
+                _table: &str,
+                _rows: &[HashMap<String, Value>],
+            ) -> Result<usize> {
+                Ok(0)
+            }
+            async fn row_count(&self, _table: &str) -> Result<usize> {
+                Ok(0)
+            }
+            async fn foreign_key_parents(&self, _table: &str) -> Result<Vec<String>> {
+                Err(SyncError::TableNotFound(
+                    "simulated PRAGMA foreign_key_list failure".to_string(),
+                ))
+            }
+        }
+
+        /// The other side: only `list_tables` is ever called on it by
+        /// `get_tables_to_sync` (foreign-key introspection only reads
+        /// `local`), so everything else is unreachable and left unused.
+        struct StubRemote;
+
+        impl DataSource for StubRemote {
+            async fn list_tables(&self) -> Result<Vec<String>> {
+                Ok(vec!["orders".to_string()])
+            }
+            async fn table_info(&self, _table: &str) -> Result<TableInfo> {
+                Err(SyncError::TableNotFound("unused".to_string()))
+            }
+            async fn get_row_metadata(
+                &self,
+                _table: &str,
+                _timestamp_column: &str,
+                _exclude_columns: &[String],
+            ) -> Result<HashMap<String, RowMeta>> {
+                Ok(HashMap::new())
+            }
+            async fn get_rows(
+                &self,
+                _table: &str,
+                _pk_values: &[String],
+            ) -> Result<Vec<HashMap<String, Value>>> {
+                Ok(vec![])
+            }
+            async fn upsert_rows(
+                &self,
+                _table: &str,
+                _rows: &[HashMap<String, Value>],
+            ) -> Result<usize> {
+                Ok(0)
+            }
+            async fn row_count(&self, _table: &str) -> Result<usize> {
+                Ok(0)
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unreadable_foreign_key_list_fails_the_call_rather_than_falling_back_silently() {
+            let local = FkErrorLocal;
+            let remote = StubRemote;
+            let config = Config::from_toml_str("").unwrap();
+
+            let err = get_tables_to_sync(&local, &remote, &config)
+                .await
+                .expect_err(
+                    "a table whose foreign-key list cannot be read must fail the call, \
+                     not silently fall back to treating it as having no parents",
+                );
+            assert!(
+                matches!(err, SyncError::TableNotFound(_)),
+                "the underlying foreign_key_parents error propagates unchanged: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1262,6 +1642,108 @@ mod tests {
             let (body, ssn) = read(&local_path, "n2");
             assert_eq!(body, "remote body");
             assert_eq!(ssn.as_deref(), Some("unset"), "schema default, not a loss");
+        }
+    }
+
+    // #435: a push of a normal parent/child schema must not fail against a
+    // target that enforces foreign keys. Before the fix, `get_tables_to_sync`
+    // wrote tables alphabetically -- "order_details" sorts before "orders",
+    // so the child landed before the parent it references existed, and SQLite
+    // (with `PRAGMA foreign_keys = ON`, as D1 and node:sqlite always enforce)
+    // rejected the insert. This test pushes to a `LocalDb` opened with that
+    // pragma set explicitly, so the same failure is reproducible without a
+    // real D1/node:sqlite target: it must fail on the pre-#435 write order and
+    // succeed once tables are written in dependency order.
+    #[cfg(feature = "native")]
+    mod fk_write_order {
+        use super::super::{push_all, NoProgress};
+        use crate::config::Config;
+        use crate::local::LocalDb;
+        use rusqlite::Connection;
+        use tempfile::TempDir;
+
+        // Westwind's own shape: order_details -> orders -> customers, chosen
+        // because "order_details" sorts alphabetically *before* "orders" --
+        // the exact case the old alphabetical order got backwards.
+        const SCHEMA: &str = "
+            CREATE TABLE customers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE orders (
+                id TEXT PRIMARY KEY,
+                customer_id TEXT NOT NULL REFERENCES customers(id),
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE order_details (
+                id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL REFERENCES orders(id),
+                updated_at TEXT NOT NULL
+            );
+        ";
+
+        fn seeded_source(path: &std::path::Path) {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute_batch(
+                "INSERT INTO customers (id, name, updated_at) VALUES ('c1', 'Ann', '2026-01-01');
+                 INSERT INTO orders (id, customer_id, updated_at) VALUES ('o1', 'c1', '2026-01-01');
+                 INSERT INTO order_details (id, order_id, updated_at) VALUES ('d1', 'o1', '2026-01-01');",
+            )
+            .unwrap();
+        }
+
+        /// An empty target with the same schema, opened with foreign-key
+        /// enforcement turned on for the connection smugglr actually writes
+        /// through -- `LocalDb` holds one connection for its whole lifetime
+        /// (see `LocalDb::conn`), so a pragma set here is the pragma every
+        /// upsert in this test runs under.
+        fn empty_target_enforcing_foreign_keys(path: &std::path::Path) -> LocalDb {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            drop(conn);
+
+            let target = LocalDb::open(path).unwrap();
+            target
+                .conn()
+                .execute_batch("PRAGMA foreign_keys = ON;")
+                .expect("enabling FK enforcement on the target connection");
+            target
+        }
+
+        #[tokio::test]
+        async fn a_push_lands_every_parent_before_its_children() {
+            let dir = TempDir::new().unwrap();
+            let source_path = dir.path().join("source.sqlite");
+            let target_path = dir.path().join("target.sqlite");
+            seeded_source(&source_path);
+            let target = empty_target_enforcing_foreign_keys(&target_path);
+
+            let source = LocalDb::open(&source_path).unwrap();
+            let config = Config::from_toml_str("").unwrap();
+
+            let results = push_all(&source, &target, &config, None, false, &NoProgress)
+                .await
+                .expect(
+                    "push must succeed against an FK-enforcing target: on the old \
+                     alphabetical write order this fails inserting order_details, \
+                     whose parent order o1 does not exist there yet",
+                );
+
+            let order: Vec<&str> = results.iter().map(|r| r.table.as_str()).collect();
+            assert_eq!(
+                order,
+                vec!["customers", "orders", "order_details"],
+                "SyncResult order mirrors write order: every parent before its children"
+            );
+            for r in &results {
+                assert_eq!(
+                    r.rows_pushed, 1,
+                    "table {} did not push its one row",
+                    r.table
+                );
+            }
         }
     }
 

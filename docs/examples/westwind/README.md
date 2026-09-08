@@ -32,7 +32,7 @@ Every table's primary key is a UUIDv7 text column, declared `id:pk:notnull` in t
 
 Every table has `updated_at` in unix seconds. `newer_wins` orders on it, and the LAN mesh's `ordering_columns` default to it.
 
-No column declares a foreign key. The relationships are real (`orders.customer_id` is a customer's `id`), and the scaffold could declare them with the `fk` modifier, but smugglr writes tables in alphabetical order, so a target that enforces foreign keys would reject `order_details` before `orders` arrived (#435). The sample stays syncable to every target it is used against by leaving enforcement to the application.
+No column declares a foreign key. The relationships are real (`orders.customer_id` is a customer's `id`), and sync itself no longer needs the omission -- it writes tables in dependency order now, so a target that enforces foreign keys gets `orders` before `order_details` (#435). What still stops the scaffold from declaring them is narrower: `smugglr migrate new`'s `fk` modifier infers its target table by stripping a column's `_id` suffix, with no pluralization and no override, so `customer_id:fk` infers `customer`, not `customers` -- every reference here would name a table that does not exist. The sample stays syncable to every target it is used against by leaving enforcement to the application until the generator can name a plural target.
 
 Two things the 0.5.0 scaffold cannot say, so the sample does without them: a composite unique constraint (Northwind's `(order_id, product_id)`), and a self-reference on `employees.reports_to`, since `fk` infers its table from a `<table>_id` name.
 
