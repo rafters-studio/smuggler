@@ -14,9 +14,10 @@
 //! outside the `migrate` module and both need this.
 //!
 //! Deliberately **ungated** (no `#[cfg(feature = "native")]`): every
-//! function reachable from [`top_level_items`] or [`declares_without_rowid`]
-//! is a pure `&str` scan with no I/O, and `pk_check::classify_table_ddl` --
-//! one of the two callers -- must keep compiling on `wasm32`. A handful of
+//! function [`pk_check`](crate::pk_check) reaches -- [`top_level_items`],
+//! [`declares_without_rowid`], [`top_level_span`], [`strip_identifier`] --
+//! is a pure `&str` scan with no I/O, and `pk_check::classify_table_ddl`
+//! must keep compiling on `wasm32`. A handful of
 //! byte-oriented helpers (`skip_ws`, `match_kw`, `ident_end`, `is_ident_byte`)
 //! moved here too for the same DRY reason but stay `#[cfg(feature =
 //! "native")]`: their only caller, `migrate::apply::splice_create_table_name`,
