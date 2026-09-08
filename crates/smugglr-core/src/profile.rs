@@ -520,41 +520,52 @@ mod tests {
     mod d1_reads_its_own_responses {
         use super::*;
 
-        /// The shape Cloudflare's D1 query API documents: a `result` array of
-        /// statement results, each with `results` as an array of row objects.
+        /// A response recorded from a real D1 database.
         ///
-        /// Derived from Cloudflare's published response format, NOT captured
-        /// from a live database -- this repository has no D1 account. See the
-        /// PR body; #436's criterion asking for recorded responses from each
-        /// hosted service is not met by these and is called out there.
-        fn d1_response(rows: Value) -> Value {
+        /// The four files under `tests/fixtures/d1/` were captured with
+        /// wrangler's local D1 -- the same engine Cloudflare runs, reached
+        /// through Miniflare rather than the REST endpoint, so no account or
+        /// token is needed. That directory's README records the exact commands
+        /// and states what these do and do not prove. Reading them from disk
+        /// rather than inlining them is deliberate: a fixture that can be
+        /// hand-edited to match the code is not a recording.
+        fn recorded(name: &str) -> Value {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/d1/");
+            let text = std::fs::read_to_string(format!("{dir}{name}.json"))
+                .unwrap_or_else(|e| panic!("recorded fixture {name}: {e}"));
+            serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("fixture {name} is not JSON: {e}"))
+        }
+
+        /// A response in the recorded envelope, for shapes that probe reader
+        /// behavior D1 does not currently produce (an empty result, a row
+        /// missing a key). Those are about how the READER must behave, so they
+        /// are constructed rather than recorded, and say so.
+        fn constructed(rows: Value) -> Value {
             serde_json::json!({
-                "result": [{ "results": rows, "success": true }],
-                "success": true,
+                "result": [{ "results": rows, "success": true, "meta": {"duration": 0} }],
                 "errors": [],
-                "messages": []
+                "messages": [],
+                "success": true
             })
         }
 
         #[test]
         fn a_table_listing_yields_table_names_as_rows_not_as_columns() {
-            let response = d1_response(serde_json::json!([
-                {"name": "users"},
-                {"name": "posts"}
-            ]));
+            let response = recorded("sqlite_master_listing");
             let p = Profile::d1();
 
             let columns = p.extract_columns(&response).expect("columns");
             assert_eq!(
                 columns,
                 vec!["name".to_string()],
-                "the only column is `name`; `users` and `posts` are VALUES"
+                "the only column is `name`; `customers` and `orders` are VALUES"
             );
 
             let rows = p.extract_rows(&response, &columns).expect("rows");
             assert_eq!(
                 rows,
-                vec![vec![Value::from("users")], vec![Value::from("posts")],],
+                vec![vec![Value::from("customers")], vec![Value::from("orders")],],
                 "each table name must arrive as a row, which is what list_tables reads"
             );
         }
@@ -565,10 +576,7 @@ mod tests {
             // the column list. The old aliasing read the ROWS as descriptors, so
             // the column list became the column NAMES and every lookup missed --
             // yielding a table with no primary key, which sync refuses.
-            let response = d1_response(serde_json::json!([
-                {"cid": 0, "name": "id", "type": "TEXT", "notnull": 1, "dflt_value": null, "pk": 1},
-                {"cid": 1, "name": "body", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 0}
-            ]));
+            let response = recorded("pragma_table_info");
             let p = Profile::d1();
 
             let columns = p.extract_columns(&response).expect("columns");
@@ -590,7 +598,7 @@ mod tests {
         fn an_empty_result_set_is_not_an_error() {
             // No first row means no keys to read. This must not be mistaken for
             // a parse failure -- an empty table is ordinary.
-            let response = d1_response(serde_json::json!([]));
+            let response = constructed(serde_json::json!([]));
             let p = Profile::d1();
             assert_eq!(p.extract_columns(&response), None);
             assert_eq!(p.extract_rows(&response, &[]), Some(vec![]));
@@ -601,10 +609,7 @@ mod tests {
             // The third shape the adapter sends: `SELECT <pk> AS __pk,
             // updated_at, ... FROM t`. Read against the wrong column list this
             // yields no `__pk` and every row is skipped as unkeyed.
-            let response = d1_response(serde_json::json!([
-                {"__pk": "a-uuid", "updated_at": 1700000000, "body": "first"},
-                {"__pk": "b-uuid", "updated_at": 1700000001, "body": "second"}
-            ]));
+            let response = recorded("metadata_select");
             let p = Profile::d1();
             let columns = p.extract_columns(&response).expect("columns");
             assert!(columns.contains(&"__pk".to_string()), "got {columns:?}");
@@ -621,17 +626,16 @@ mod tests {
             // rather than as a missing column, because the row is rebuilt by
             // NAME from the column list -- a dropped key would shift nothing but
             // would silently write a NULL over a real value on upsert.
-            let response = d1_response(serde_json::json!([
-                {"id": "a-uuid", "body": "first", "note": null}
-            ]));
+            let response = recorded("row_fetch");
             let p = Profile::d1();
             let columns = p.extract_columns(&response).expect("columns");
             assert_eq!(columns.len(), 3, "got {columns:?}");
 
             let rows = p.extract_rows(&response, &columns).expect("rows");
-            let note = columns.iter().position(|c| c == "note").expect("note");
-            assert_eq!(rows[0][note], Value::Null);
-            assert_eq!(rows[0].len(), 3);
+            let name = columns.iter().position(|c| c == "name").expect("name");
+            assert_eq!(rows[0][name], Value::from("Alice"));
+            assert_eq!(rows[1][name], Value::Null, "a NULL must arrive as NULL");
+            assert_eq!(rows[1].len(), 3);
         }
 
         #[test]
@@ -640,7 +644,7 @@ mod tests {
             // which D1 does not do today, but the reader must not corrupt if it
             // did -- the value must be NULL in that column, never a left-shift
             // that puts a body where a timestamp belongs.
-            let response = d1_response(serde_json::json!([
+            let response = constructed(serde_json::json!([
                 {"id": "a", "body": "first", "note": "n"},
                 {"id": "b", "body": "second"}
             ]));

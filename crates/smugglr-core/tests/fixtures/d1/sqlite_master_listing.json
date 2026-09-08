@@ -1,0 +1,15 @@
+{
+  "result": [
+    {
+      "results": [
+        { "name": "customers" },
+        { "name": "orders" }
+      ],
+      "success": true,
+      "meta": { "duration": 0 }
+    }
+  ],
+  "errors": [],
+  "messages": [],
+  "success": true
+}

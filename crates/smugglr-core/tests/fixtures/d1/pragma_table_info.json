@@ -1,0 +1,16 @@
+{
+  "result": [
+    {
+      "results": [
+        { "cid": 0, "name": "id", "type": "TEXT", "notnull": 1, "dflt_value": null, "pk": 1 },
+        { "cid": 1, "name": "name", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 0 },
+        { "cid": 2, "name": "updated_at", "type": "INTEGER", "notnull": 1, "dflt_value": null, "pk": 0 }
+      ],
+      "success": true,
+      "meta": { "duration": 0 }
+    }
+  ],
+  "errors": [],
+  "messages": [],
+  "success": true
+}

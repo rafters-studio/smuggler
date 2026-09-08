@@ -1,0 +1,15 @@
+{
+  "result": [
+    {
+      "results": [
+        { "id": "a-uuid", "name": "Alice", "updated_at": 1700000000 },
+        { "id": "b-uuid", "name": null, "updated_at": 1700000001 }
+      ],
+      "success": true,
+      "meta": { "duration": 0 }
+    }
+  ],
+  "errors": [],
+  "messages": [],
+  "success": true
+}
