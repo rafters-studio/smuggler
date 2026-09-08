@@ -902,17 +902,68 @@ async fn gather_status<D: DataSource>(db: &D, config: &Config) -> StatusDb {
     }
 }
 
-/// The endpoint a resolved target will actually talk to, when there is one.
+/// The endpoint a resolved target will actually talk to, redacted for display.
 ///
 /// For a `d1` target the URL is derived from `account_id` and `database_id`
 /// (#429), so it appears in no file the operator wrote. `status` shows it, which
 /// is the only place a wrong account or database is visible before a push goes
-/// somewhere unintended. Returns only the URL -- the same plugin config carries
-/// the auth token, which stays out of every output.
+/// somewhere unintended.
+///
+/// A `d1` URL carries no secret -- the token travels as a bearer header. But
+/// this reads `url` out of ANY plugin target's config, and `[target] type =
+/// "plugin"` takes a free-form map an operator fills in, so a generic, turso, or
+/// rqlite endpoint may legitimately carry `https://user:pass@host` or
+/// `?api_key=...`. Status output is pasted into CI logs and issue reports, so
+/// both are stripped by [`redact_url_secrets`] before display. Narrowing this to
+/// the d1 shape instead would have been the other fix, and a worse one: an
+/// operator on a hosted backend is exactly who needs to see where a push is
+/// going.
 fn plugin_endpoint(target: &ResolvedTarget) -> Option<String> {
     match target {
         ResolvedTarget::Sqlite { .. } => None,
-        ResolvedTarget::Plugin { config, .. } => config.get("url").cloned(),
+        ResolvedTarget::Plugin { config, .. } => {
+            config.get("url").map(|url| redact_url_secrets(url))
+        }
+    }
+}
+
+/// Strip the two places a URL carries a credential: `user:pass@` before the
+/// host, and the whole query string.
+///
+/// Deliberately blunt. The query is dropped entire rather than per-parameter,
+/// because deciding which parameter names are secret is a guess and this is a
+/// display path where being wrong leaks. What survives -- scheme, host, path --
+/// is what tells an operator whether they are pointed at the right database,
+/// which is the whole reason the line exists.
+///
+/// String surgery rather than a URL parser: the crate has no direct `url`
+/// dependency, this runs on a value that may not parse as a URL at all (the
+/// config field is a free-form string), and a parser that rejects a malformed
+/// endpoint would hide exactly the typo an operator is looking for.
+fn redact_url_secrets(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (format!("{}://", s), r),
+        None => (String::new(), url),
+    };
+
+    // Userinfo, if any, is everything before the first `@` in the authority --
+    // and the authority ends at the first `/`, `?` or `#`, so an `@` after that
+    // (in a path or query) is not userinfo and must not be treated as such.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let rest = match rest[..authority_end].rfind('@') {
+        Some(at) => format!("***@{}", &rest[at + 1..]),
+        None => rest.to_string(),
+    };
+
+    let (before_query, had_query) = match rest.split_once('?') {
+        Some((head, _)) => (head.to_string(), true),
+        None => (rest, false),
+    };
+
+    if had_query {
+        format!("{}{}?<redacted>", scheme, before_query)
+    } else {
+        format!("{}{}", scheme, before_query)
     }
 }
 
@@ -1481,5 +1532,78 @@ mod status_shows_the_endpoint {
             database: "backup.db".into(),
         };
         assert_eq!(plugin_endpoint(&target), None);
+    }
+
+    /// A generic plugin target is a free-form operator map, so its url can carry
+    /// a credential the d1 shape never does. Review of #447 caught that
+    /// plugin_endpoint reads `url` for EVERY plugin target, which turned status
+    /// -- an output people paste into CI logs and issue reports -- into a new
+    /// path for those secrets to escape.
+    fn generic_plugin_target(url: &str) -> ResolvedTarget {
+        let mut config = std::collections::HashMap::new();
+        config.insert("url".to_string(), url.to_string());
+        ResolvedTarget::Plugin {
+            path: PathBuf::from("/fake/smugglr-http-sql"),
+            name: "smugglr-http-sql".to_string(),
+            config,
+        }
+    }
+
+    #[test]
+    fn url_embedded_userinfo_never_reaches_the_endpoint_line() {
+        let target =
+            generic_plugin_target("https://admin:hunter2@rqlite.example.com:4001/db/query");
+        let shown = plugin_endpoint(&target).expect("a plugin target has an endpoint");
+        assert!(
+            !shown.contains("hunter2"),
+            "password must not survive: {shown}"
+        );
+        assert!(
+            !shown.contains("admin"),
+            "username must not survive: {shown}"
+        );
+        assert_eq!(shown, "https://***@rqlite.example.com:4001/db/query");
+    }
+
+    #[test]
+    fn a_query_string_is_dropped_whole() {
+        let target = generic_plugin_target("https://db.example.com/sql?api_key=s3cr3t&mode=rw");
+        let shown = plugin_endpoint(&target).expect("a plugin target has an endpoint");
+        assert!(
+            !shown.contains("s3cr3t"),
+            "api key must not survive: {shown}"
+        );
+        assert_eq!(shown, "https://db.example.com/sql?<redacted>");
+    }
+
+    #[test]
+    fn an_at_sign_outside_the_authority_is_not_userinfo() {
+        // The authority ends at the first `/`, so an `@` in the path is part of
+        // the path. Treating it as userinfo would silently mangle the endpoint
+        // an operator is trying to read.
+        let target = generic_plugin_target("https://db.example.com/tenants/a@b/query");
+        let shown = plugin_endpoint(&target).expect("a plugin target has an endpoint");
+        assert_eq!(shown, "https://db.example.com/tenants/a@b/query");
+    }
+
+    #[test]
+    fn a_d1_endpoint_is_unchanged_by_redaction() {
+        // The d1 URL carries no credential -- the token is a bearer header --
+        // so redaction must be a no-op on it, or the fix for the generic case
+        // would have broken the case #429 exists to serve.
+        let target = plugin_target(d1_plugin_config("acct", "db", "tok", None));
+        assert_eq!(
+            plugin_endpoint(&target).as_deref(),
+            Some("https://api.cloudflare.com/client/v4/accounts/acct/d1/database/db/query")
+        );
+    }
+
+    #[test]
+    fn a_url_that_is_not_a_url_survives_readably() {
+        // The config field is a free-form string. A malformed endpoint is
+        // exactly the typo status exists to surface, so redaction must not
+        // swallow it.
+        let target = generic_plugin_target("not-a-url");
+        assert_eq!(plugin_endpoint(&target).as_deref(), Some("not-a-url"));
     }
 }

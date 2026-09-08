@@ -1147,6 +1147,30 @@ mod tests {
         assert!(!config.should_sync_table("disciplines"));
     }
 
+    /// `resolve_d1_plugin_target` must add nothing to what `d1_plugin_config`
+    /// synthesized -- only the plugin binary path and the name.
+    ///
+    /// Review of #447 caught the hole this closes: the plugin crate's wire tests
+    /// drive `d1_plugin_config` directly, and these tests drive `resolve_target`,
+    /// so the two suites never observe the same call. A stray insert into the
+    /// map after the `d1_plugin_config` call would have passed both. This pins
+    /// the wrapper as a wrapper.
+    #[test]
+    fn resolve_target_hands_the_plugin_exactly_what_the_synthesis_built() {
+        let config = test_config_d1();
+        let ResolvedTarget::Plugin {
+            config: resolved, ..
+        } = config.resolve_target().unwrap()
+        else {
+            panic!("a d1 target must resolve to the http-sql plugin");
+        };
+        assert_eq!(
+            resolved,
+            d1_plugin_config("test_acct", "test_db", "test_token", None),
+            "resolve_target must not add, drop, or rewrite any key"
+        );
+    }
+
     #[test]
     fn test_resolve_target_legacy_d1() {
         let config = test_config_d1();

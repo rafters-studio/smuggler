@@ -771,6 +771,7 @@ mod tests {
 #[cfg(test)]
 struct CapturedRequest {
     path: String,
+    host: Option<String>,
     authorization: Option<String>,
 }
 
@@ -792,7 +793,14 @@ async fn capture_one_request(
     let addr = listener.local_addr().expect("read back the bound port");
 
     let handle = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("accept the adapter");
+        // Bounded so a future change that stops terminating the header block
+        // fails by name in seconds instead of hanging CI with no diagnostic --
+        // review of #447 flagged the unbounded version as a footgun.
+        let deadline = std::time::Duration::from_secs(10);
+        let (mut socket, _) = tokio::time::timeout(deadline, listener.accept())
+            .await
+            .expect("the adapter must connect within the deadline")
+            .expect("accept the adapter");
 
         // Read until the header block ends. The adapter sends a small JSON body
         // with Content-Length, so one read is not guaranteed to cover it; loop
@@ -800,7 +808,10 @@ async fn capture_one_request(
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
         loop {
-            let n = socket.read(&mut chunk).await.expect("read the request");
+            let n = tokio::time::timeout(deadline, socket.read(&mut chunk))
+                .await
+                .expect("the adapter must finish its header block within the deadline")
+                .expect("read the request");
             if n == 0 {
                 break;
             }
@@ -817,10 +828,16 @@ async fn capture_one_request(
             .and_then(|line| line.split_whitespace().nth(1))
             .unwrap_or_default()
             .to_string();
-        let authorization = text
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-            .map(|l| l["authorization:".len()..].trim().to_string());
+        let header = |name: &str| -> Option<String> {
+            text.lines()
+                .find(|l| l.to_ascii_lowercase().starts_with(name))
+                .map(|l| l[name.len()..].trim().to_string())
+        };
+        let authorization = header("authorization:");
+        // Host plus the request path is the whole URL as it went out. Without
+        // it a test asserting only the path cannot tell one endpoint from
+        // another, which review of #447 flagged as overstating what is checked.
+        let host = header("host:");
 
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -835,6 +852,7 @@ async fn capture_one_request(
 
         CapturedRequest {
             path,
+            host,
             authorization,
         }
     });
@@ -993,6 +1011,10 @@ mod d1_target_reaches_d1 {
         assert_eq!(
             captured.path,
             "/client/v4/accounts/acct/d1/database/db/query"
+        );
+        assert_eq!(
+            captured.host.as_deref(),
+            Some(endpoint.trim_start_matches("http://"))
         );
         assert_eq!(captured.authorization.as_deref(), Some("Bearer tok"));
     }
