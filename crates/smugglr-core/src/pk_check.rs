@@ -302,7 +302,7 @@ pub fn classify_table_ddl(table: &str, ddl: &str) -> Vec<PkFinding> {
 /// `PRIMARY KEY` -- which IS the rowid alias. Asking this question rather
 /// than "was this column already the rowid alias"
 /// ([`ParsedTable::rowid_alias_column`]) is deliberate and narrower: that
-/// question answers "no" for two shapes this fix does not own --  a
+/// question answers "no" for two shapes this fix does not own -- a
 /// composite key's member (never had an ASC/DESC spelling of its own to
 /// preserve) and a `WITHOUT ROWID` table's key (no rowid to be an alias of,
 /// so ASC/DESC there is ordinary index direction, not the alias question at
