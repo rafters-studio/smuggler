@@ -210,27 +210,37 @@ impl Profile {
     pub fn extract_columns(&self, response: &Value) -> Option<Vec<String>> {
         match &self.columns {
             ColumnSource::Path(path) => {
-                let arr = Self::extract_path(response, path)?.as_array()?;
-                let names: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| {
-                        if let Some(s) = v.as_str() {
-                            Some(s.to_string())
-                        } else {
-                            v.as_object()?
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .map(String::from)
-                        }
+                // Every miss falls through to the rows: a path that resolves to
+                // nothing, a path that resolves to a non-array, and a path whose
+                // array holds neither names nor descriptors. All three are cases
+                // the two adapter copies handled before this logic moved here,
+                // and `?`-chaining the first two out of the function was a
+                // regression review caught -- a Datasette response carrying
+                // `rows` but no `columns` went from a successful read to
+                // "columns not found in response".
+                let names = Self::extract_path(response, path)
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| {
+                                if let Some(s) = v.as_str() {
+                                    Some(s.to_string())
+                                } else {
+                                    v.as_object()?
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .map(String::from)
+                                }
+                            })
+                            .collect::<Vec<String>>()
                     })
-                    .collect();
+                    .unwrap_or_default();
+
                 if !names.is_empty() {
                     return Some(names);
                 }
-                // A declared descriptor path that held neither names nor
-                // descriptors. Fall through to the rows rather than returning an
-                // empty column list, which would silently produce zero-width
-                // rows.
+                // An empty column list would silently produce zero-width rows,
+                // so the rows decide instead.
                 self.first_row_keys(response)
             }
             ColumnSource::FirstRowKeys => self.first_row_keys(response),
@@ -655,6 +665,105 @@ mod tests {
             let note = columns.iter().position(|c| c == "note").expect("note");
             assert_eq!(rows[1][body], Value::from("second"));
             assert_eq!(rows[1][note], Value::Null);
+        }
+
+        /// The three ways a `Path` profile can miss, all of which must reach the
+        /// rows rather than fail the read.
+        ///
+        /// Review of #451 caught two of these being dropped: the move into
+        /// `Profile` used `?` where the two adapter copies had fallen through,
+        /// so a Datasette response carrying `rows` but no `columns` went from a
+        /// successful read to "columns not found in response". These pin all
+        /// three so the fallback cannot vanish again in a diff billed as a move.
+        #[test]
+        fn a_path_profile_falls_back_to_the_rows_on_every_kind_of_miss() {
+            let p = Profile::datasette();
+
+            let absent = serde_json::json!({
+                "rows": [{"id": "a", "body": "first"}]
+            });
+            assert_eq!(
+                p.extract_columns(&absent).map(|mut c| {
+                    c.sort();
+                    c
+                }),
+                Some(vec!["body".to_string(), "id".to_string()]),
+                "a missing columns path must fall through to the rows"
+            );
+
+            let not_an_array = serde_json::json!({
+                "columns": {"unexpected": "shape"},
+                "rows": [{"id": "a", "body": "first"}]
+            });
+            assert_eq!(
+                p.extract_columns(&not_an_array).map(|mut c| {
+                    c.sort();
+                    c
+                }),
+                Some(vec!["body".to_string(), "id".to_string()]),
+                "a non-array columns path must fall through to the rows"
+            );
+
+            let no_names = serde_json::json!({
+                "columns": [1, 2],
+                "rows": [{"id": "a", "body": "first"}]
+            });
+            assert_eq!(
+                p.extract_columns(&no_names).map(|mut c| {
+                    c.sort();
+                    c
+                }),
+                Some(vec!["body".to_string(), "id".to_string()]),
+                "a columns path holding neither names nor descriptors falls through"
+            );
+        }
+
+        #[test]
+        fn a_path_profile_with_nothing_to_read_says_so() {
+            // The fallback must not become "always succeed": with no columns and
+            // no rows there is genuinely nothing, and the adapters turn None into
+            // a named error rather than an empty successful read.
+            let p = Profile::datasette();
+            assert_eq!(p.extract_columns(&serde_json::json!({})), None);
+            assert_eq!(p.extract_columns(&serde_json::json!({"rows": []})), None);
+        }
+
+        /// Datasette, recorded from a real instance (#436).
+        ///
+        /// The opposite shape to D1: rows are ARRAYS and a real `columns` list
+        /// is sent, which is why this profile declares `ColumnSource::Path` and
+        /// D1 declares `FirstRowKeys`. Recorded rather than reasoned about, so
+        /// the distinction rests on a response instead of a reading of the docs.
+        /// `tests/fixtures/datasette/README.md` has the commands.
+        #[test]
+        fn datasette_reads_its_own_recorded_responses() {
+            fn recorded_datasette(name: &str) -> Value {
+                let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/datasette/");
+                let text = std::fs::read_to_string(format!("{dir}{name}.json"))
+                    .unwrap_or_else(|e| panic!("recorded fixture {name}: {e}"));
+                serde_json::from_str(&text).expect("fixture is JSON")
+            }
+            let p = Profile::datasette();
+
+            let listing = recorded_datasette("sqlite_master_listing");
+            let columns = p.extract_columns(&listing).expect("columns");
+            assert_eq!(columns, vec!["name".to_string()]);
+            let rows = p.extract_rows(&listing, &columns).expect("rows");
+            assert_eq!(rows, vec![vec![Value::from("customers")]]);
+
+            let meta = recorded_datasette("metadata_select");
+            let columns = p.extract_columns(&meta).expect("columns");
+            assert_eq!(columns, vec!["__pk".to_string(), "updated_at".to_string()]);
+            let rows = p.extract_rows(&meta, &columns).expect("rows");
+            assert_eq!(rows[0][0], Value::from("a-uuid"));
+
+            // Array rows are taken as-is; a NULL stays a NULL rather than being
+            // dropped or shifted.
+            let fetch = recorded_datasette("row_fetch");
+            let columns = p.extract_columns(&fetch).expect("columns");
+            let rows = p.extract_rows(&fetch, &columns).expect("rows");
+            assert_eq!(rows[1][1], Value::Null);
+            assert_eq!(rows[1].len(), 3);
         }
 
         #[test]

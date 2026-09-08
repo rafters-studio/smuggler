@@ -134,7 +134,7 @@ impl FetchDataSource {
     /// Rows for a response, delegated to the profile (#436).
     ///
     /// This and `extract_columns` were byte-identical copies here and in the
-    /// wasm fetch adapter, which is why the d1 column-source defect broke both
+    /// http-sql plugin, which is why the d1 column-source defect broke both
     /// paths at once. One implementation now, in `Profile`.
     fn extract_rows(&self, response: &Value, columns: &[String]) -> Result<Vec<Vec<Value>>> {
         self.profile
