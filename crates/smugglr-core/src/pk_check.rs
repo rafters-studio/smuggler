@@ -396,13 +396,22 @@ impl ParsedTable {
     /// Parse a `CREATE TABLE` statement. Returns `None` when the DDL is not a
     /// parseable `CREATE TABLE` (e.g. a view or malformed text).
     fn parse(ddl: &str) -> Option<Self> {
-        let body = extract_body(ddl)?;
-        let clauses = split_top_level(&body);
+        // `crate::sql_ddl::top_level_items` will happily split *any* top-level
+        // parenthesised list, including one buried in a `CREATE VIEW ... AS
+        // SELECT count(*) FROM t` -- so the "is this actually a CREATE TABLE"
+        // guard has to run first, same as the old `extract_body` did.
+        let trimmed = ddl.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if !lower.starts_with("create") || !lower.contains("table") {
+            return None;
+        }
+
+        let clauses = crate::sql_ddl::top_level_items(ddl)?;
 
         let mut columns = Vec::new();
         let mut table_pk = Vec::new();
 
-        for clause in &clauses {
+        for (_, clause) in &clauses {
             let clause = clause.trim();
             if clause.is_empty() {
                 continue;
@@ -417,7 +426,7 @@ impl ParsedTable {
             }
         }
 
-        let without_rowid = tail_has_without_rowid(ddl);
+        let without_rowid = crate::sql_ddl::declares_without_rowid(ddl);
 
         Some(Self {
             columns,
@@ -527,89 +536,6 @@ impl ParsedTable {
     }
 }
 
-/// Extract the parenthesised column-definition body of a `CREATE TABLE`.
-fn extract_body(ddl: &str) -> Option<String> {
-    let trimmed = ddl.trim_start();
-    // Must begin with CREATE ... TABLE. `CREATE TEMP TABLE`, `CREATE TABLE IF
-    // NOT EXISTS`, etc. all reach the first `(` the same way.
-    let lower = trimmed.to_ascii_lowercase();
-    if !lower.starts_with("create") || !lower.contains("table") {
-        return None;
-    }
-    let open = ddl.find('(')?;
-    let close = matching_paren(ddl, open)?;
-    Some(ddl[open + 1..close].to_string())
-}
-
-/// Find the index of the `)` matching the `(` at `open`, respecting quotes.
-fn matching_paren(s: &str, open: usize) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut depth = 0usize;
-    let mut i = open;
-    let mut quote: Option<u8> = None;
-    while i < bytes.len() {
-        let c = bytes[i];
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                b'\'' | b'"' | b'`' => quote = Some(c),
-                b'[' => quote = Some(b']'),
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            },
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Split a column-definition body on top-level commas, respecting nested parens
-/// and quoted identifiers/strings.
-fn split_top_level(body: &str) -> Vec<String> {
-    let bytes = body.as_bytes();
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut quote: Option<u8> = None;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let c = bytes[i];
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                b'\'' | b'"' | b'`' => quote = Some(c),
-                b'[' => quote = Some(b']'),
-                b'(' => depth += 1,
-                b')' => depth = depth.saturating_sub(1),
-                b',' if depth == 0 => {
-                    out.push(body[start..i].to_string());
-                    start = i + 1;
-                }
-                _ => {}
-            },
-        }
-        i += 1;
-    }
-    if start < body.len() {
-        out.push(body[start..].to_string());
-    }
-    out
-}
-
 /// Tokenize a clause into whitespace-separated words, stripping identifier
 /// quoting from the first token and treating a `(...)` group as one token.
 fn tokenize(clause: &str) -> Vec<String> {
@@ -683,12 +609,11 @@ fn parse_table_pk_constraint(clause: &str) -> Option<Vec<String>> {
         return None;
     };
 
-    let open = rest.find('(')?;
-    let close = matching_paren(rest, open)?;
+    let (open, close) = crate::sql_ddl::top_level_span(rest)?;
     let inner = &rest[open + 1..close];
     let cols = inner
         .split(',')
-        .map(|c| strip_identifier(c.trim()))
+        .map(|c| crate::sql_ddl::strip_identifier(c.trim()))
         // Drop a trailing ASC/DESC/COLLATE on a PK column reference.
         .map(|c| c.split_whitespace().next().unwrap_or("").to_string())
         .filter(|c| !c.is_empty())
@@ -774,32 +699,6 @@ fn is_constraint_keyword(upper: &[String], i: usize) -> bool {
             | "AS"
             | "CONSTRAINT"
     )
-}
-
-/// Whether the DDL declares `WITHOUT ROWID` after the closing paren.
-fn tail_has_without_rowid(ddl: &str) -> bool {
-    if let Some(open) = ddl.find('(') {
-        if let Some(close) = matching_paren(ddl, open) {
-            let tail = ddl[close + 1..].to_ascii_lowercase();
-            let tail = tail.replace(['\n', '\t'], " ");
-            return tail.contains("without rowid");
-        }
-    }
-    false
-}
-
-/// Strip surrounding identifier quoting (`"x"`, `` `x` ``, `[x]`) from a token.
-fn strip_identifier(tok: &str) -> String {
-    let tok = tok.trim();
-    let bytes = tok.as_bytes();
-    if bytes.len() >= 2 {
-        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
-        let matched = matches!((first, last), (b'"', b'"') | (b'`', b'`') | (b'[', b']'));
-        if matched {
-            return tok[1..tok.len() - 1].to_string();
-        }
-    }
-    tok.to_string()
 }
 
 #[cfg(test)]
@@ -1056,6 +955,38 @@ mod tests {
     fn unparseable_ddl_yields_no_findings() {
         assert!(classify_table_ddl("v", "CREATE VIEW v AS SELECT 1").is_empty());
         assert!(classify_table_ddl("t", "not sql at all").is_empty());
+    }
+
+    /// smugglr#462: before the shared `sql_ddl::top_level_items` parser, a
+    /// `(` hidden inside a `--` comment (an issue reference like `#123 (see
+    /// thread)` is a realistic way for one to show up) threw off this
+    /// module's own `matching_paren`'s depth count -- it had no comment
+    /// branch at all -- so the whole `CREATE TABLE` looked unparseable and
+    /// `classify_table_ddl` silently returned no findings for a table that
+    /// genuinely mints a rowid-alias PK. This DDL fails to classify at all
+    /// before the fix and correctly reports `IntegerPrimaryKey` after it.
+    #[test]
+    fn a_paren_inside_a_line_comment_does_not_hide_a_real_pk_issue() {
+        let findings = classify_table_ddl(
+            "t",
+            "CREATE TABLE t (\n  id INTEGER PRIMARY KEY, -- needs (fixing\n  v TEXT\n)",
+        );
+        assert_eq!(
+            issues(&findings),
+            vec![PkIssue::IntegerPrimaryKey],
+            "a comment containing an unbalanced paren must not hide the finding: {findings:?}"
+        );
+    }
+
+    /// A doubled double-quote inside a quoted identifier does not derail
+    /// classification of the column that carries it. This is a regression
+    /// pin, not a before/after case -- it already passed before this fix;
+    /// `sql_ddl::top_level_items_recovers_a_doubled_quote_identifier_verbatim`
+    /// is the test that pins the actual content-recovery improvement.
+    #[test]
+    fn a_doubled_quote_in_the_pk_column_name_still_classifies() {
+        let findings = classify_table_ddl("t", "CREATE TABLE t (\"na\"\"me\" INTEGER PRIMARY KEY)");
+        assert_eq!(issues(&findings), vec![PkIssue::IntegerPrimaryKey]);
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod migrate;
 pub mod pk_check;
 pub mod profile;
 pub mod rowhash;
+pub(crate) mod sql_ddl;
 pub mod sync;
 pub mod table;
 
