@@ -145,12 +145,13 @@ mod tests {
         );
     }
 
-    // Batch-size/param-limit chunking is adapter policy (max_rows_per_batch
-    // lives in each adapter, not here) -- that behavior stays tested in
-    // plugins/smugglr-http-sql/src/adapter.rs::batch_splitting_respects_param_limit
-    // and crates/smugglr-wasm/src/local_adapter.rs. This module only owns SQL
-    // generation for an already-chunked batch, which the snapshot test above
-    // and the tests below cover.
+    // Batch-size/param-limit chunking for the HTTP-SQL adapters is
+    // `http_sql::max_rows_per_batch` (#461) -- tested alongside it in
+    // `http_sql.rs`. `LocalSqlDataSource`'s own chunking constant
+    // (`LOCAL_MAX_BIND_PARAMS`) is a different limit for a different, non-HTTP
+    // executor, and stays tested in `crates/smugglr-wasm/src/local_adapter.rs`.
+    // This module only owns SQL generation for an already-chunked batch,
+    // which the snapshot test above and the tests below cover.
 
     #[test]
     fn rows_to_maps_basic() {
