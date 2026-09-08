@@ -42,6 +42,13 @@ pub struct TableOutput {
     pub rows_pushed: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub rows_pulled: usize,
+    /// How many times the write to this table backed off and retried (#444).
+    /// Omitted (not merely `0`) when no retry happened, matching
+    /// `rows_pushed`/`rows_pulled`'s convention, so a run where every batch
+    /// succeeded on its first attempt stays byte-identical on the wire to a
+    /// build before this field existed.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retry_count: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -59,6 +66,7 @@ fn table_outputs(results: &[SyncResult]) -> Vec<TableOutput> {
             name: r.table.clone(),
             rows_pushed: r.rows_pushed,
             rows_pulled: r.rows_pulled,
+            retry_count: r.retry_count,
         })
         .collect()
 }
@@ -372,6 +380,7 @@ mod tests {
                 table: "abilities".into(),
                 rows_pushed: 42,
                 rows_pulled: 0,
+                retry_count: 0,
                 diff_stats: None,
                 diff_detail: None,
             },
@@ -379,6 +388,7 @@ mod tests {
                 table: "items".into(),
                 rows_pushed: 0,
                 rows_pulled: 0,
+                retry_count: 0,
                 diff_stats: None,
                 diff_detail: None,
             },
@@ -396,6 +406,55 @@ mod tests {
         assert_eq!(v["tables"][0]["rows_pushed"], 42);
         // error should be absent (skip_serializing_if)
         assert!(v.get("error").is_none());
+    }
+
+    // #444: the retry count a table's write needed must be visible in
+    // --output json exactly when it is nonzero, matching the
+    // rows_pushed/rows_pulled skip_serializing_if convention -- so an agent
+    // can tell a sync that backed off twice from one that sailed through
+    // without any change to the wire shape for the common (no-retry) case.
+    #[test]
+    fn test_command_output_reports_retry_count_when_nonzero() {
+        let results = vec![SyncResult {
+            table: "abilities".into(),
+            rows_pushed: 42,
+            rows_pulled: 0,
+            retry_count: 2,
+            diff_stats: None,
+            diff_detail: None,
+        }];
+
+        let out = CommandOutput::from_sync_results("push", &results);
+        let json = serde_json::to_string(&out).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["tables"][0]["retry_count"], 2);
+    }
+
+    #[test]
+    fn golden_command_output_with_retries() {
+        // Companion to golden_command_output (which pins the zero-retry wire
+        // shape carrying no retry_count key at all): this pins the exact
+        // shape once a retry happened, key included.
+        let results = vec![SyncResult {
+            table: "abilities".into(),
+            rows_pushed: 42,
+            rows_pulled: 0,
+            retry_count: 2,
+            diff_stats: None,
+            diff_detail: None,
+        }];
+        let out = CommandOutput::from_sync_results("push", &results);
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "push",
+                "status": "ok",
+                "tables": [
+                    { "name": "abilities", "rows_pushed": 42, "retry_count": 2 }
+                ]
+            })
+        );
     }
 
     #[test]
@@ -422,6 +481,7 @@ mod tests {
             table: "t".into(),
             rows_pushed: 3,
             rows_pulled: 7,
+            retry_count: 0,
             diff_stats: None,
             diff_detail: None,
         }];
@@ -513,6 +573,7 @@ mod tests {
                 table: "abilities".into(),
                 rows_pushed: 8,
                 rows_pulled: 3,
+                retry_count: 0,
                 diff_stats: Some(DiffStats {
                     local_only: 3,
                     remote_only: 1,
@@ -527,6 +588,7 @@ mod tests {
                 table: "items".into(),
                 rows_pushed: 0,
                 rows_pulled: 0,
+                retry_count: 0,
                 diff_stats: Some(DiffStats {
                     local_only: 0,
                     remote_only: 0,
@@ -574,6 +636,7 @@ mod tests {
             table: "t".into(),
             rows_pushed: 5,
             rows_pulled: 2,
+            retry_count: 0,
             diff_stats: None,
             diff_detail: None,
         }];
@@ -599,6 +662,7 @@ mod tests {
             table: "abilities".into(),
             rows_pushed: 3,
             rows_pulled: 1,
+            retry_count: 0,
             diff_stats: Some(DiffStats {
                 local_only: 2,
                 remote_only: 1,
@@ -656,6 +720,7 @@ mod tests {
                 table: "abilities".into(),
                 rows_pushed: 42,
                 rows_pulled: 0,
+                retry_count: 0,
                 diff_stats: None,
                 diff_detail: None,
             },
@@ -663,6 +728,7 @@ mod tests {
                 table: "items".into(),
                 rows_pushed: 0,
                 rows_pulled: 0,
+                retry_count: 0,
                 diff_stats: None,
                 diff_detail: None,
             },
@@ -686,6 +752,7 @@ mod tests {
             table: "items".into(),
             rows_pushed: 0,
             rows_pulled: 0,
+            retry_count: 0,
             diff_stats: None,
             diff_detail: None,
         }];
@@ -789,6 +856,7 @@ mod tests {
             table: "t".into(),
             rows_pushed: 3,
             rows_pulled: 7,
+            retry_count: 0,
             diff_stats: None,
             diff_detail: None,
         }];
@@ -812,6 +880,7 @@ mod tests {
             table: "t".into(),
             rows_pushed: 3,
             rows_pulled: 7,
+            retry_count: 0,
             diff_stats: None,
             diff_detail: None,
         }];
@@ -920,6 +989,7 @@ mod tests {
             table: "abilities".into(),
             rows_pushed: 8,
             rows_pulled: 3,
+            retry_count: 0,
             diff_stats: Some(DiffStats {
                 local_only: 3,
                 remote_only: 1,
@@ -962,6 +1032,7 @@ mod tests {
             table: "abilities".into(),
             rows_pushed: 3,
             rows_pulled: 1,
+            retry_count: 0,
             diff_stats: Some(DiffStats {
                 local_only: 2,
                 remote_only: 1,
