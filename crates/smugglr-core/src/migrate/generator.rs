@@ -661,10 +661,10 @@ mod tests {
     }
 
     #[test]
-    fn bare_int_column_with_pk_modifier_is_refused_regardless_of_declared_type_order() {
-        // The `pk` modifier alone, on an int column, is exactly the shape
-        // apply.rs would render as a bare `INTEGER PRIMARY KEY`.
-        let err = generate("create_widgets", &["id:int:pk".into()]).unwrap_err();
+    fn int_pk_is_refused_even_when_not_the_first_column() {
+        // The refusal must inspect every column, not just the first -- a
+        // check that only looked at columns[0] would miss this.
+        let err = generate("create_widgets", &["name".into(), "id:int:pk".into()]).unwrap_err();
         assert!(matches!(err, GeneratorError::RowidPrimaryKey(_)));
     }
 
