@@ -393,8 +393,13 @@ fn the_migration() -> ChecksummedManifest {
                 table: CREATED_TABLE.into(),
                 columns: vec![
                     Column {
+                        // TEXT, not INTEGER (#427): a bare `INTEGER PRIMARY
+                        // KEY` is the rowid alias migrate now refuses, and
+                        // this table's shape is incidental to what the test
+                        // exercises -- it exists only so the oracle's table
+                        // inventory has something to compare.
                         name: "id".into(),
-                        kind: ColumnKind::Int,
+                        kind: ColumnKind::Text,
                         constraints: vec![Constraint::Pk],
                         tags: Vec::new(),
                     },
@@ -446,7 +451,8 @@ fn after_the_migration(start: &Schema) -> Schema {
     let created = schema()
         .table(
             table(CREATED_TABLE)
-                .pk_int("id")
+                // TEXT, matching `the_migration`'s now-TEXT `id` (#427).
+                .pk_text("id")
                 .col("note", ColumnType::Text, []),
         )
         .build()

@@ -81,6 +81,15 @@ pub enum GeneratorError {
     /// A `range=LOW..HIGH` argument was malformed.
     #[error("invalid range bounds '{bounds}' on column '{column}': expected LOW..HIGH with numeric bounds")]
     InvalidRangeBounds { column: String, bounds: String },
+    /// The declared primary key mints the SQLite rowid alias (or explicit
+    /// `AUTOINCREMENT`) -- forbidden by smugglr's own primary-key requirement
+    /// (see `crate::pk_check`): a per-node sequential key collides across
+    /// nodes on a masterless fabric. Unlike an existing database (#280, a
+    /// different issue), this is new DDL `migrate new` is about to mint, so
+    /// there is an in-tool remedy -- declare the column `id:pk` (TEXT)
+    /// instead -- and this refuses rather than warns (#427).
+    #[error("{0}")]
+    RowidPrimaryKey(String),
 }
 
 /// Parse a Rails-style migration invocation into a [`Manifest`].
@@ -131,6 +140,24 @@ pub fn generate(name: &str, specs: &[String]) -> Result<Manifest, GeneratorError
         }));
         down_forward_order.push(Op::DropIndex { name: index });
     }
+
+    // Refuse at scaffold time (#427): a rowid-alias or AUTOINCREMENT primary
+    // key must never reach a manifest in the first place. Reuses apply.rs's
+    // exact DDL rendering and pk_check.rs's classifier so `migrate new` and
+    // `migrate apply` (which runs the same check over a hand-authored
+    // manifest) agree byte-for-byte on what counts as the forbidden shape.
+    // The message comes from `pk_check::render_refusals`, shared with
+    // `enforce`'s Refuse arm, so the two sites cannot drift. Routing through
+    // `enforce`'s rendered SyncError instead would double the "Configuration
+    // error:" prefix once `run_new` wraps this error too, which is why the
+    // renderer is shared and the error type is not.
+    let refusals = crate::migrate::apply::rowid_alias_findings(&up);
+    if !refusals.is_empty() {
+        return Err(GeneratorError::RowidPrimaryKey(
+            crate::pk_check::render_refusals(&refusals),
+        ));
+    }
+
     let down: Vec<ClassifiedOp> = down_forward_order
         .into_iter()
         .rev()
@@ -614,6 +641,39 @@ mod tests {
             err,
             GeneratorError::UnsupportedName("add_email_to_users".to_string())
         );
+    }
+
+    #[test]
+    fn int_pk_is_refused_at_scaffold_time() {
+        // #427: the generator must not mint the rowid alias `id INTEGER
+        // PRIMARY KEY` that smugglr's own primary-key requirement forbids.
+        let err = generate("create_things", &["id:int:pk".into(), "name".into()]).unwrap_err();
+        match err {
+            GeneratorError::RowidPrimaryKey(msg) => {
+                assert!(msg.contains("things"), "must name the table: {msg}");
+                assert!(msg.contains("UUIDv7"), "must carry the remedy: {msg}");
+            }
+            other => panic!("expected RowidPrimaryKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn int_pk_is_refused_even_when_not_the_first_column() {
+        // The refusal must inspect every column, not just the first -- a
+        // check that only looked at columns[0] would miss this.
+        let err = generate("create_widgets", &["name".into(), "id:int:pk".into()]).unwrap_err();
+        assert!(matches!(err, GeneratorError::RowidPrimaryKey(_)));
+    }
+
+    #[test]
+    fn text_pk_still_scaffolds() {
+        // The accepted case: `id:pk` defaults to TEXT (per
+        // `pk_modifier_defaults_type_to_text` above), which is not a rowid
+        // alias and must not be refused.
+        let m = generate("create_contacts", &["id:pk".into(), "name".into()]).unwrap();
+        let (_, cols, _) = create_table(&m);
+        assert_eq!(cols[0].kind, ColumnKind::Text);
+        assert_eq!(cols[0].constraints, vec![Constraint::Pk]);
     }
 
     #[test]
