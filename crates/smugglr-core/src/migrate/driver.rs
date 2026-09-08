@@ -1018,18 +1018,19 @@ mod tests {
     }
 
     // -- #463: the shared elect_apply_settle funnel, pinned directly --------
+    //
+    // [`elect_apply_settle`] is the one place both [`apply_migration`] (above)
+    // and [`apply_compensating`](crate::migrate::reverse::apply_compensating)
+    // (`reverse.rs`) get their claim-run-settle behavior from. Pinning it here,
+    // on the shared function itself rather than only through each caller's own
+    // tests, is the point: a future edit to this one copy that broke the
+    // funnel for, say, `apply_compensating` alone would still pass every
+    // `apply_migration` test above, because `apply_migration` never exercises
+    // `apply_compensating`'s call site. A direct test on the shared function
+    // is what actually protects both callers from drifting apart again -- the
+    // failure mode #463 exists to close.
 
-    /// [`elect_apply_settle`] is the one place both [`apply_migration`] (above)
-    /// and [`apply_compensating`](crate::migrate::reverse::apply_compensating)
-    /// (`reverse.rs`) get their claim-run-settle behavior from. Pinning it
-    /// here, on the shared function itself rather than only through each
-    /// caller's own tests, is the point: a future edit to this one copy that
-    /// broke the funnel for, say, `apply_compensating` alone would still pass
-    /// every `apply_migration` test above, because `apply_migration` never
-    /// exercises `apply_compensating`'s call site. A direct test on the
-    /// shared function is what actually protects both callers from drifting
-    /// apart again -- the failure mode #463 exists to close.
-    /// The success half of the same funnel: `run`'s value travels back out
+    /// The success half of the funnel: `run`'s value travels back out
     /// untouched, and the row settles `success`.
     #[test]
     fn elect_apply_settle_returns_runs_value_and_settles_success_on_ok() {
