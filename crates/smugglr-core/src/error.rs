@@ -159,6 +159,33 @@ pub enum SyncError {
     PluginConflict { plugin: String, message: String },
 }
 
+/// How an HTTP status from a remote target should be treated on retry (#444).
+///
+/// Shared because it was not, and that cost a shipped defect. The http-sql
+/// plugin classified 429 and 5xx while the wasm fetch adapter mapped every
+/// non-2xx to a non-retryable error, so a browser client got one attempt at a
+/// 503 where the CLI backed off -- the same divergence that produced #436, in
+/// the same pair of files. Each adapter still renders its own error type; only
+/// the judgement is shared, because the judgement is what must not differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpRetryClass {
+    /// 429. Back off, honouring `Retry-After` when the response carries one.
+    RateLimited,
+    /// 5xx. Back off on the configured schedule.
+    Transient,
+    /// Everything else, 4xx included. Retrying will not help.
+    Permanent,
+}
+
+/// Classify a remote target's HTTP status for retry.
+pub fn http_retry_class(status: u16) -> HttpRetryClass {
+    match status {
+        429 => HttpRetryClass::RateLimited,
+        s if s >= 500 => HttpRetryClass::Transient,
+        _ => HttpRetryClass::Permanent,
+    }
+}
+
 impl SyncError {
     /// Check if this error is retryable with exponential backoff.
     ///
@@ -255,6 +282,43 @@ impl SyncError {
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
+
+#[cfg(test)]
+mod http_retry_class_is_shared {
+    use super::*;
+
+    /// Pinned in core rather than in either adapter, because the defect was that
+    /// the two adapters disagreed and neither had a test that could notice.
+    /// `crates/smugglr-wasm` is `#![cfg(target_arch = "wasm32")]` and carries no
+    /// tests at all, so a host-side assertion here is the only place this can be
+    /// checked without a browser.
+    #[test]
+    fn the_retryable_statuses_are_the_ones_the_engine_retries() {
+        assert_eq!(http_retry_class(429), HttpRetryClass::RateLimited);
+        for s in [500, 502, 503, 504, 599] {
+            assert_eq!(http_retry_class(s), HttpRetryClass::Transient, "status {s}");
+        }
+        // 4xx other than 429 must NOT retry: the request is wrong and repeating
+        // it is wrong the same way.
+        for s in [400, 401, 403, 404, 409, 413, 415, 422] {
+            assert_eq!(http_retry_class(s), HttpRetryClass::Permanent, "status {s}");
+        }
+    }
+
+    #[test]
+    fn every_class_maps_to_the_retry_decision_it_promises() {
+        // The class is only worth having if the SyncError it renders to actually
+        // retries. This is the assertion that would have failed on the wasm path
+        // before the fix, where every non-2xx became SyncError::Remote.
+        assert!(SyncError::RateLimited { retry_after: None }.is_retryable());
+        assert!(SyncError::ServerError {
+            status: 503,
+            message: String::new()
+        }
+        .is_retryable());
+        assert!(!SyncError::Remote(String::new()).is_retryable());
+    }
+}
 
 #[cfg(test)]
 mod tests {

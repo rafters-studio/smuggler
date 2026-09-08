@@ -26,12 +26,17 @@ fn classify_http_error(
     retry_after_ms: Option<u64>,
     detail: String,
 ) -> PluginError {
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        PluginError::rate_limited(retry_after_ms, detail)
-    } else if status.is_server_error() {
-        PluginError::transient(detail)
-    } else {
-        PluginError::new(detail)
+    // The judgement lives in core so this adapter and the wasm fetch adapter
+    // cannot answer differently -- they did, until an audit found that #444 had
+    // landed here and not there, leaving a browser client with one attempt at a
+    // 503. Only the rendering is local: this side speaks PluginError, that side
+    // speaks SyncError.
+    match smugglr_core::error::http_retry_class(status.as_u16()) {
+        smugglr_core::error::HttpRetryClass::RateLimited => {
+            PluginError::rate_limited(retry_after_ms, detail)
+        }
+        smugglr_core::error::HttpRetryClass::Transient => PluginError::transient(detail),
+        smugglr_core::error::HttpRetryClass::Permanent => PluginError::new(detail),
     }
 }
 

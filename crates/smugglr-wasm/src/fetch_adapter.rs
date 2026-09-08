@@ -5,7 +5,7 @@
 
 use smugglr_core::config::DuplicatePkPolicy;
 use smugglr_core::datasource::{DataSource, RowMeta, TableInfo};
-use smugglr_core::error::{Result, SyncError};
+use smugglr_core::error::{HttpRetryClass, Result, SyncError};
 use smugglr_core::profile::{AuthFormat, Profile};
 use std::collections::HashMap;
 
@@ -114,10 +114,34 @@ impl FetchDataSource {
             .await
             .map_err(|e| SyncError::Remote(format!("failed to read body: {:?}", e)))?;
             let body_str = body_text.as_string().unwrap_or_default();
-            return Err(SyncError::Remote(format!(
-                "HTTP {} from {}: {}",
-                status, self.url, body_str
-            )));
+            let message = format!("HTTP {} from {}: {}", status, self.url, body_str);
+
+            // Classify by status, the same way the http-sql plugin adapter does
+            // (#444). Returning `SyncError::Remote` for every non-2xx -- which
+            // this path did until now -- makes `is_retryable` fall to its
+            // `_ => false` arm, so a browser or Node client got ONE attempt at a
+            // 503 while the CLI backed off and retried the same endpoint.
+            //
+            // The audit that found it also found why: this adapter and
+            // `plugins/smugglr-http-sql/src/adapter.rs` are the same DataSource
+            // over the same Profile, written twice, so #444 landed on one copy.
+            // The same shape produced #436. Classifying here closes the gap;
+            // collapsing the two adapters is the actual fix and is not this
+            // change's job.
+            return Err(match smugglr_core::error::http_retry_class(status) {
+                HttpRetryClass::RateLimited => SyncError::RateLimited {
+                    // Absent Retry-After the engine falls back to its configured
+                    // backoff, so `None` still retries rather than failing.
+                    retry_after: resp
+                        .headers()
+                        .get("retry-after")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse::<u64>().ok()),
+                },
+                HttpRetryClass::Transient => SyncError::ServerError { status, message },
+                HttpRetryClass::Permanent => SyncError::Remote(message),
+            });
         }
 
         let json_promise = resp
