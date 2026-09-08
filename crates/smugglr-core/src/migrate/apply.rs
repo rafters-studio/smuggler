@@ -893,12 +893,26 @@ fn rebuild_dropping_column(
     // has no way to know the column was carried, so it reports a constraint the
     // rebuilt table demonstrably still enforces.
     //
-    // `CHECK` and `COLLATE` are deliberately NOT filtered here even when they
-    // ride through the same way, and the asymmetry is a limit rather than an
-    // oversight: those two are found by a keyword scan of the whole table's DDL
-    // and cannot be attributed to a column, so there is nothing to match them
-    // against. They stay over-reported, which is the direction the rest of
-    // `lost_constructs` already errs in.
+    // `CHECK` and `COLLATE` need no equivalent filter here (smugglr#462):
+    // `lost_constructs` now attributes each occurrence to the top-level item
+    // that names it and only reports the dropped column's own clause or a
+    // table-level constraint, so a construct on some other ordinary column
+    // -- the case this filter exists to catch for generated columns and
+    // `UNIQUE` -- is never reported as lost in the first place.
+    //
+    // What that attribution does not model, and this filter does not cover
+    // either, is the narrower fact that a *surviving* column is not always
+    // carried verbatim: a PK column never is (`verbatim_ordinary` above
+    // deliberately excludes it, so its `CHECK`/`COLLATE` really is rebuilt
+    // away by `render_def`), and an ordinary column's verbatim carry is
+    // all-or-nothing across every kept ordinary column, so one unresolved
+    // definition silently loses `CHECK`/`COLLATE` on every other surviving
+    // ordinary column too. Both are real, narrow under-reports this issue
+    // knowingly accepts rather than simulates -- the rest of the module
+    // already treats "the dropped column's own clause" as the case worth
+    // pinning (see `lost_constructs`'s doc), and over-reporting on every
+    // other CHECK/COLLATE in the table, as the pre-#462 scan did, cost the
+    // warning its value on the case that is real.
     {
         // Every column carried verbatim, generated or ordinary. The first
         // version of this filter only considered generated ones while its own
@@ -1026,82 +1040,6 @@ pub(crate) struct RebuildSpec {
 #[cfg(feature = "native")]
 const REBUILD_TMP: &str = "_smugglr_rebuild_tmp";
 
-/// A byte that can appear inside a bare SQL identifier.
-#[cfg(feature = "native")]
-fn is_ident_byte(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
-}
-
-/// Advance past ASCII whitespace from `i`.
-#[cfg(feature = "native")]
-fn skip_ws(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    i
-}
-
-/// Match `word` case-insensitively at `i`, requiring a trailing word boundary.
-/// Returns the index just past the keyword, or `None` if it does not match.
-#[cfg(feature = "native")]
-fn match_kw(b: &[u8], i: usize, word: &str) -> Option<usize> {
-    let w = word.as_bytes();
-    let end = i.checked_add(w.len())?;
-    if end > b.len() || !b[i..end].eq_ignore_ascii_case(w) {
-        return None;
-    }
-    if end < b.len() && is_ident_byte(b[end]) {
-        return None;
-    }
-    Some(end)
-}
-
-/// The end index (exclusive) of one SQL identifier starting at `i`, honouring
-/// `"..."`, `` `...` ``, `[...]`, and bare forms. `None` if `i` is not an
-/// identifier start.
-#[cfg(feature = "native")]
-fn ident_end(b: &[u8], i: usize) -> Option<usize> {
-    if i >= b.len() {
-        return None;
-    }
-    match b[i] {
-        q @ (b'"' | b'`') => {
-            let mut j = i + 1;
-            while j < b.len() {
-                if b[j] == q {
-                    // A doubled quote is an escaped literal, not the terminator.
-                    if j + 1 < b.len() && b[j + 1] == q {
-                        j += 2;
-                    } else {
-                        return Some(j + 1);
-                    }
-                } else {
-                    j += 1;
-                }
-            }
-            None
-        }
-        b'[' => {
-            let mut j = i + 1;
-            while j < b.len() {
-                if b[j] == b']' {
-                    return Some(j + 1);
-                }
-                j += 1;
-            }
-            None
-        }
-        c if is_ident_byte(c) && !c.is_ascii_digit() => {
-            let mut j = i;
-            while j < b.len() && is_ident_byte(b[j]) {
-                j += 1;
-            }
-            Some(j)
-        }
-        _ => None,
-    }
-}
-
 /// Splice `new_name` (quoted) in for the table name of a verbatim
 /// `CREATE TABLE` statement, leaving the rest of the DDL byte-for-byte intact.
 ///
@@ -1112,6 +1050,8 @@ fn ident_end(b: &[u8], i: usize) -> Option<usize> {
 /// the name identifier, then replaces just that span.
 #[cfg(feature = "native")]
 fn splice_create_table_name(create_sql: &str, new_name: &str) -> Result<String, MigrateError> {
+    use crate::sql_ddl::{ident_end, match_kw, skip_ws};
+
     let b = create_sql.as_bytes();
     let not_create = || {
         MigrateError::Apply(format!(
@@ -1490,111 +1430,6 @@ fn table_sql(conn: &Connection, table: &str) -> Result<Option<String>, MigrateEr
     Ok(sql.flatten())
 }
 
-/// The verbatim text of each top-level item in a `CREATE TABLE`'s parenthesised
-/// list, paired with the identifier it starts with.
-///
-/// This is how #387 preserves a generated column: `PRAGMA table_xinfo` names one
-/// and gives its storage class, but the *generation expression* is in no pragma
-/// at all -- `sqlite_master.sql` is the only place `(n * 2)` exists. Taking the
-/// column's whole definition verbatim recovers the expression and everything
-/// else declared alongside it, without this function needing to understand any
-/// of it.
-///
-/// Returns `None` rather than a guess whenever the text cannot be split
-/// confidently: no parenthesised list, an unbalanced one, or an item with no
-/// leading identifier. **A wrong answer here produces a table that is broken
-/// rather than merely diminished**, so every uncertain case falls back to the
-/// caller's existing warn-and-drop behaviour.
-///
-/// Items include table-level constraints (`PRIMARY KEY (...)`, `FOREIGN KEY
-/// (...)`), which start with a keyword rather than a column name. They are
-/// returned too and the caller ignores them by looking up only names the pragma
-/// called generated -- with a duplicate-name check as the safety valve, since a
-/// column named `foreign` would otherwise collide with a `FOREIGN KEY` clause.
-#[cfg(feature = "native")]
-fn top_level_items(create_sql: &str) -> Option<Vec<(String, String)>> {
-    let mut depth = 0usize;
-    let mut open: Option<usize> = None;
-    let mut close: Option<usize> = None;
-    let mut splits: Vec<usize> = Vec::new();
-
-    let mut chars = create_sql.char_indices().peekable();
-    while let Some((at, c)) = chars.next() {
-        match c {
-            // Literals and quoted identifiers are skipped whole: a comma or a
-            // parenthesis inside one is text, not structure. A doubled quote
-            // escapes, as it does everywhere else in this module.
-            '\'' | '"' | '`' => {
-                while let Some((_, n)) = chars.next() {
-                    if n == c {
-                        if chars.peek().map(|(_, p)| *p) == Some(c) {
-                            chars.next();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-            '[' if depth > 0 => {
-                for (_, n) in chars.by_ref() {
-                    if n == ']' {
-                        break;
-                    }
-                }
-            }
-            '-' if chars.peek().map(|(_, p)| *p) == Some('-') => {
-                for (_, n) in chars.by_ref() {
-                    if n == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek().map(|(_, p)| *p) == Some('*') => {
-                chars.next();
-                let mut prev = '\0';
-                for (_, n) in chars.by_ref() {
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-            }
-            '(' => {
-                depth += 1;
-                if depth == 1 {
-                    open = Some(at);
-                }
-            }
-            ')' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 && close.is_none() {
-                    close = Some(at);
-                }
-            }
-            ',' if depth == 1 => splits.push(at),
-            _ => {}
-        }
-    }
-
-    // An unbalanced list, or none at all, is not something to guess about.
-    if depth != 0 {
-        return None;
-    }
-    let (open, close) = (open?, close?);
-
-    let mut items = Vec::new();
-    let mut from = open + 1;
-    for cut in splits.iter().copied().chain(std::iter::once(close)) {
-        let text = create_sql.get(from..cut)?.trim();
-        from = cut + 1;
-        if text.is_empty() {
-            continue;
-        }
-        items.push((leading_identifier(text)?, text.to_string()));
-    }
-    Some(items)
-}
-
 /// The verbatim definition of each named column, or `None` if any of them
 /// cannot be resolved unambiguously.
 ///
@@ -1612,7 +1447,7 @@ fn verbatim_definitions_for(
     wanted: &[&(String, &'static str)],
     dropped: &str,
 ) -> Option<Vec<(String, String)>> {
-    let items = top_level_items(create_sql?)?;
+    let items = crate::sql_ddl::top_level_items(create_sql?)?;
     let mut out = Vec::with_capacity(wanted.len());
     for (name, _) in wanted {
         let mut matches = items
@@ -1699,7 +1534,7 @@ fn contains_line_comment(sql: &str) -> bool {
 fn inline_reference_target(definition: &str) -> Option<String> {
     let mut seen_keyword = false;
     let mut target = None;
-    any_sql_identifier(definition, |quoted, token| {
+    crate::sql_ddl::any_sql_identifier(definition, |quoted, token| {
         if seen_keyword {
             target = Some(token.to_string());
             return true;
@@ -1712,110 +1547,6 @@ fn inline_reference_target(definition: &str) -> Option<String> {
     target
 }
 
-/// The first identifier-position token of a column definition or constraint.
-#[cfg(feature = "native")]
-fn leading_identifier(item: &str) -> Option<String> {
-    let mut first = None;
-    any_sql_identifier(item, |_quoted, token| {
-        first = Some(token.to_string());
-        true
-    });
-    first
-}
-
-/// Scan `sql` for identifier-position tokens, calling `f(quoted, token)` on each
-/// bare word and each quoted identifier (`"x"`, `` `x` ``, `[x]`). String
-/// literals (`'...'`) and comments (`-- ...`, `/* ... */`) are skipped, never
-/// reported. Char-based (UTF-8 safe); a doubled quote escapes.
-///
-/// Returns as soon as `f` returns `true`, reporting whether it ever did. The
-/// `quoted` flag is the whole difference between this module's two keyword
-/// scans: [`sql_has_autoincrement`] wants bare tokens only (a table named
-/// `"autoincrement"` must not count), while [`sql_mentions_identifier`] wants
-/// both (a trigger body may write `NEW."email"`).
-#[cfg(feature = "native")]
-fn any_sql_identifier(sql: &str, mut f: impl FnMut(bool, &str) -> bool) -> bool {
-    let mut chars = sql.chars().peekable();
-    let mut bare = String::new();
-    let mut quoted = String::new();
-    while let Some(c) = chars.next() {
-        // A bare identifier runs over ASCII word bytes plus any non-ASCII char
-        // (SQLite admits those unquoted).
-        if c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii() {
-            bare.push(c);
-            continue;
-        }
-        if !bare.is_empty() {
-            if f(false, &bare) {
-                return true;
-            }
-            bare.clear();
-        }
-        match c {
-            '\'' => {
-                while let Some(n) = chars.next() {
-                    if n == '\'' {
-                        if chars.peek() == Some(&'\'') {
-                            chars.next(); // doubled quote escapes
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-            '"' | '`' => {
-                quoted.clear();
-                while let Some(n) = chars.next() {
-                    if n == c {
-                        if chars.peek() == Some(&c) {
-                            chars.next();
-                            quoted.push(c);
-                            continue;
-                        }
-                        break;
-                    }
-                    quoted.push(n);
-                }
-                if f(true, &quoted) {
-                    return true;
-                }
-            }
-            '[' => {
-                quoted.clear();
-                for n in chars.by_ref() {
-                    if n == ']' {
-                        break;
-                    }
-                    quoted.push(n);
-                }
-                if f(true, &quoted) {
-                    return true;
-                }
-            }
-            '-' if chars.peek() == Some(&'-') => {
-                chars.next();
-                for n in chars.by_ref() {
-                    if n == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut prev = '\0';
-                for n in chars.by_ref() {
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-            }
-            _ => {}
-        }
-    }
-    !bare.is_empty() && f(false, &bare)
-}
-
 /// Whether a `CREATE TABLE` statement declares `AUTOINCREMENT`. The keyword is
 /// only legal on the single `INTEGER PRIMARY KEY` rowid alias. It is matched as a
 /// bare token *outside* string literals, quoted identifiers, and comments, so a
@@ -1825,7 +1556,7 @@ fn any_sql_identifier(sql: &str, mut f: impl FnMut(bool, &str) -> bool) -> bool 
 /// drop-column rebuild.
 #[cfg(feature = "native")]
 fn sql_has_autoincrement(sql: &str) -> bool {
-    any_sql_identifier(sql, |quoted, tok| {
+    crate::sql_ddl::any_sql_identifier(sql, |quoted, tok| {
         !quoted && tok.eq_ignore_ascii_case("AUTOINCREMENT")
     })
 }
@@ -1846,7 +1577,7 @@ fn sql_has_autoincrement(sql: &str) -> bool {
 /// resolves, and every subsequent write to the table fails at prepare time.
 #[cfg(feature = "native")]
 fn sql_mentions_identifier(sql: &str, ident: &str) -> bool {
-    any_sql_identifier(sql, |_quoted, tok| tok.eq_ignore_ascii_case(ident))
+    crate::sql_ddl::any_sql_identifier(sql, |_quoted, tok| tok.eq_ignore_ascii_case(ident))
 }
 
 /// Surviving constructs the `DROP COLUMN` reconstruction cannot recover, as
@@ -1855,10 +1586,27 @@ fn sql_mentions_identifier(sql: &str, ident: &str) -> bool {
 /// `UNIQUE` is detected precisely from `PRAGMA index_list` (origin `'u'`
 /// auto-indexes): a unique index all of whose columns survive is lost, while one
 /// that references the dropped column goes away with the column anyway.
-/// `CHECK` / `COLLATE` / `WITHOUT ROWID` are not exposed by any pragma, so they
-/// are found by a keyword scan of the original DDL -- an over-approximation (it
-/// can fire when the construct referenced only the dropped column), but a
-/// spurious warning is safer than a silent drop.
+///
+/// `CHECK` / `COLLATE` / `WITHOUT ROWID` are not exposed by any pragma either,
+/// so they are found by scanning the original DDL -- but, since smugglr#462,
+/// through `sql_ddl::top_level_items` rather than `up.contains("CHECK")` on
+/// the whole statement. The old whole-statement scan over-reported: every
+/// surviving *ordinary* column is carried into the rebuild **verbatim**
+/// (#387, this module's own doc above), `CHECK`/`COLLATE` included, so a
+/// `CHECK` declared on some other column that is not being dropped rode
+/// through untouched and was warned about anyway. The new scan attributes
+/// each occurrence to the top-level item that names it: the dropped column's
+/// own clause (genuinely gone with the column), or a table-level constraint
+/// (`CHECK (...)` outside any column, `CONSTRAINT ...`) -- which this rebuild
+/// never re-emits at all, only `PRIMARY KEY` and `FOREIGN KEY` are
+/// reconstructed, above -- so it stays an unconditional loss regardless of
+/// which column it mentions. A `CHECK`/`COLLATE` on any other, ordinary,
+/// surviving column is no longer reported. `WITHOUT ROWID` keeps its
+/// unconditional-loss shape (this rebuild never recovers it, full stop,
+/// `RebuildTarget::Fragments`'s `without_rowid: false` below) but is now read
+/// from the tail after the column list rather than a substring of the whole
+/// statement, so a comment or a quoted default mentioning the phrase can no
+/// longer produce a false positive.
 ///
 /// `dropped_triggers` are the triggers [`aux_ddl_surviving_drop`] decided it
 /// cannot replay (their bodies mention the dropped column). They are named here
@@ -1908,14 +1656,58 @@ fn lost_constructs(
         lost.push(format!("trigger {name:?} (its body references {column:?})"));
     }
     if let Some(sql) = orig_sql {
-        let up = sql.to_ascii_uppercase();
-        if up.contains("CHECK") {
-            lost.push("CHECK constraint(s)".to_string());
+        if let Some(items) = crate::sql_ddl::top_level_items(sql) {
+            // Table-level constraints start with one of these keywords
+            // rather than a column name (`sql_ddl::top_level_items`'s own
+            // doc): none of them are re-emitted by this rebuild (only
+            // `PRIMARY KEY` and `FOREIGN KEY` are, both handled specially
+            // above), so a `CHECK` living in one of these is always lost,
+            // regardless of which column it names.
+            const TABLE_LEVEL: [&str; 5] = ["PRIMARY", "UNIQUE", "CHECK", "FOREIGN", "CONSTRAINT"];
+            let mut check_lost = false;
+            let mut collate_lost = false;
+            for (leading, text) in &items {
+                // A CHECK/COLLATE on an ordinary column that is not the one
+                // being dropped rides through verbatim (#387) and is not a
+                // loss -- only the dropped column's own clause, or a
+                // table-level constraint this rebuild never reconstructs at
+                // all, still is.
+                //
+                // "Table-level" is decided from whether the item's *own*
+                // leading token is quoted, not just from what
+                // `leading_identifier` says it spells: a column named
+                // `"check"` also spells `leading == "check"`, but it is a
+                // column, and its own CHECK/COLLATE (if any) rides through
+                // verbatim the same as any other survivor. Only a bare,
+                // unquoted keyword starts an actual table-level constraint.
+                let starts_quoted = matches!(text.as_bytes().first(), Some(b'"' | b'`' | b'['));
+                let is_table_level = !starts_quoted
+                    && TABLE_LEVEL
+                        .iter()
+                        .any(|kw| leading.eq_ignore_ascii_case(kw));
+                let attributable = leading.eq_ignore_ascii_case(column) || is_table_level;
+                if !attributable {
+                    continue;
+                }
+                if crate::sql_ddl::any_sql_identifier(text, |quoted, tok| {
+                    !quoted && tok.eq_ignore_ascii_case("CHECK")
+                }) {
+                    check_lost = true;
+                }
+                if crate::sql_ddl::any_sql_identifier(text, |quoted, tok| {
+                    !quoted && tok.eq_ignore_ascii_case("COLLATE")
+                }) {
+                    collate_lost = true;
+                }
+            }
+            if check_lost {
+                lost.push("CHECK constraint(s)".to_string());
+            }
+            if collate_lost {
+                lost.push("COLLATE clause(s)".to_string());
+            }
         }
-        if up.contains("COLLATE") {
-            lost.push("COLLATE clause(s)".to_string());
-        }
-        if up.contains("WITHOUT ROWID") {
+        if crate::sql_ddl::declares_without_rowid(sql) {
             lost.push("WITHOUT ROWID".to_string());
         }
         // MATCH is not in `foreign_key_list` at all -- the pragma reports NONE
@@ -1938,7 +1730,7 @@ fn lost_constructs(
         // and the consequence is bounded -- a spurious `tracing::warn!` and no
         // change to any DDL. A silent drop is not bounded, which is why the
         // trade goes this way.
-        if any_sql_identifier(sql, |quoted, token| {
+        if crate::sql_ddl::any_sql_identifier(sql, |quoted, token| {
             !quoted && token.eq_ignore_ascii_case("MATCH")
         }) {
             lost.push(
@@ -3572,37 +3364,14 @@ mod tests {
             );
         }
 
-        /// The definition split survives the shapes that break a naive parse.
-        ///
-        /// Each of these is a case where splitting on commas, or matching
-        /// parentheses without tracking quoting, gets a different answer.
-        #[test]
-        fn top_level_items_survives_commas_and_parens_that_are_not_structure() {
-            let sql = "CREATE TABLE t (\n  \
-                 a INTEGER,\n  \
-                 b TEXT DEFAULT 'x, (y)',\n  \
-                 c INTEGER GENERATED ALWAYS AS ((n + 1) * (m - 2)) STORED,\n  \
-                 d TEXT, -- a trailing comment, with a comma\n  \
-                 \"e,f\" INTEGER,\n  \
-                 PRIMARY KEY (a, b)\n\
-                 )";
-            let items = top_level_items(sql).expect("this splits");
-            let names: Vec<&str> = items.iter().map(|(n, _)| n.as_str()).collect();
-            assert_eq!(names, vec!["a", "b", "c", "d", "e,f", "PRIMARY"]);
-
-            let (_, c) = items.iter().find(|(n, _)| n == "c").unwrap();
-            assert!(
-                c.contains("((n + 1) * (m - 2))"),
-                "the nested expression is kept whole: {c}"
-            );
-        }
-
-        /// An unbalanced or absent list is refused rather than guessed at.
-        #[test]
-        fn top_level_items_refuses_what_it_cannot_split() {
-            assert!(top_level_items("CREATE TABLE t (a INTEGER").is_none());
-            assert!(top_level_items("CREATE TABLE t").is_none());
-        }
+        // The definition split surviving the shapes that break a naive parse
+        // (comments, doubled-quote escapes, nested parens) is pinned
+        // directly against the shared parser in `sql_ddl`'s own tests
+        // (`top_level_items_survives_commas_and_parens_that_are_not_structure`,
+        // `top_level_items_refuses_what_it_cannot_split`,
+        // `top_level_items_ignores_parens_inside_comments`,
+        // `top_level_items_recovers_a_doubled_quote_identifier_verbatim`)
+        // since smugglr#462 moved `top_level_items` out of this module.
 
         /// A name that matches more than one item resolves to neither.
         #[test]
@@ -3890,6 +3659,149 @@ mod tests {
                 .query_row("SELECT count(*) FROM t WHERE tag = 'ABC'", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(matched, 1, "COLLATE NOCASE survived");
+        }
+
+        /// smugglr#462: `lost_constructs` used to warn about `CHECK`/`COLLATE`
+        /// wherever either appeared *anywhere* in the table --
+        /// `up.contains("CHECK")` on the whole original DDL -- even when the
+        /// column carrying the construct was not the one being dropped and,
+        /// per the previous test, rides through the rebuild verbatim (#387).
+        /// That is a warning firing on work that succeeded. Pinned here as
+        /// the before/after case the parser-unification diff must not carry
+        /// silently: against the old whole-statement scan, this table would
+        /// have produced both a `"CHECK...".contains` and a
+        /// `"COLLATE...".contains` hit; the narrower, column-attributed scan
+        /// must produce neither, since `amount` and `tag` both survive
+        /// `code`'s drop untouched.
+        #[test]
+        fn check_and_collate_on_a_surviving_column_are_not_warned_losses() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     amount INTEGER CHECK (amount > 0),
+                     tag TEXT COLLATE NOCASE,
+                     code TEXT UNIQUE
+                 );",
+            )
+            .unwrap();
+            let sql = table_sql(&conn, "t").unwrap();
+            let lost = lost_constructs(&conn, "t", "code", sql.as_deref(), &[]).unwrap();
+            assert!(
+                !lost.iter().any(|l| l.contains("CHECK")),
+                "amount's CHECK is on a surviving column and must not be warned: {lost:?}"
+            );
+            assert!(
+                !lost.iter().any(|l| l.contains("COLLATE")),
+                "tag's COLLATE is on a surviving column and must not be warned: {lost:?}"
+            );
+        }
+
+        /// The narrowing above must not silently swallow a genuine loss. A
+        /// `CHECK` on the column actually being dropped is still named
+        /// (nothing carries it forward -- the column is gone), and so is a
+        /// table-level `CHECK`: this rebuild never re-emits a table-level
+        /// constraint at all -- only `PRIMARY KEY` and `FOREIGN KEY` are
+        /// specially reconstructed -- regardless of which column its
+        /// expression happens to mention.
+        #[test]
+        fn check_on_the_dropped_column_or_table_level_is_still_a_warned_loss() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     code TEXT CHECK (code <> ''),
+                     n INTEGER
+                 );",
+            )
+            .unwrap();
+            let sql = table_sql(&conn, "t").unwrap();
+            let lost = lost_constructs(&conn, "t", "code", sql.as_deref(), &[]).unwrap();
+            assert!(
+                lost.iter().any(|l| l.contains("CHECK")),
+                "the dropped column's own CHECK is a real loss: {lost:?}"
+            );
+
+            let conn2 = mem();
+            conn2
+                .execute_batch(
+                    "CREATE TABLE u (
+                     id INTEGER PRIMARY KEY,
+                     a INTEGER,
+                     code TEXT,
+                     CHECK (a >= 0)
+                 );",
+                )
+                .unwrap();
+            let sql2 = table_sql(&conn2, "u").unwrap();
+            let lost2 = lost_constructs(&conn2, "u", "code", sql2.as_deref(), &[]).unwrap();
+            assert!(
+                lost2.iter().any(|l| l.contains("CHECK")),
+                "a table-level CHECK is never reconstructed, regardless of which column it \
+                 names: {lost2:?}"
+            );
+        }
+
+        /// A column named after a table-constraint keyword (`"check"`,
+        /// `"unique"`, ...) is still just a column: its own CHECK/COLLATE, if
+        /// any, rides through verbatim like any other survivor's, and it must
+        /// not be mistaken for an actual table-level constraint merely
+        /// because its *name* matches a keyword. The discriminator is
+        /// whether the item's leading token is quoted -- a real `CHECK
+        /// (...)` clause never is.
+        #[test]
+        fn a_column_named_after_a_constraint_keyword_is_not_mistaken_for_one() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     \"check\" TEXT COLLATE NOCASE,
+                     code TEXT
+                 );",
+            )
+            .unwrap();
+            let sql = table_sql(&conn, "t").unwrap();
+            let lost = lost_constructs(&conn, "t", "code", sql.as_deref(), &[]).unwrap();
+            assert!(
+                !lost.iter().any(|l| l.contains("COLLATE")),
+                "\"check\" is a surviving column, not a table-level CHECK, and its COLLATE \
+                 rides through verbatim: {lost:?}"
+            );
+        }
+
+        /// smugglr#462: `WITHOUT ROWID` moved from a substring scan of the
+        /// whole statement to reading the tail after the column list, so a
+        /// comment mentioning the phrase inside the list no longer produces
+        /// a false positive. The construct's own unconditional-loss shape is
+        /// unchanged -- a real `WITHOUT ROWID` declaration still warns.
+        #[test]
+        fn without_rowid_mention_in_a_comment_is_not_a_false_positive() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY, -- not WITHOUT ROWID, just a note
+                     code TEXT
+                 );",
+            )
+            .unwrap();
+            let sql = table_sql(&conn, "t").unwrap();
+            let lost = lost_constructs(&conn, "t", "code", sql.as_deref(), &[]).unwrap();
+            assert!(
+                !lost.iter().any(|l| l.contains("WITHOUT ROWID")),
+                "a comment mentioning the phrase must not be read as the table declaring it: \
+                 {lost:?}"
+            );
+
+            let conn2 = mem();
+            conn2
+                .execute_batch("CREATE TABLE u (id TEXT PRIMARY KEY, code TEXT) WITHOUT ROWID;")
+                .unwrap();
+            let sql2 = table_sql(&conn2, "u").unwrap();
+            let lost2 = lost_constructs(&conn2, "u", "code", sql2.as_deref(), &[]).unwrap();
+            assert!(
+                lost2.iter().any(|l| l.contains("WITHOUT ROWID")),
+                "a real WITHOUT ROWID declaration is still a loss: {lost2:?}"
+            );
         }
 
         /// MATCH cannot be reconstructed, so it is warned about instead.
