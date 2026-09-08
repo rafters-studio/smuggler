@@ -146,19 +146,16 @@ pub fn generate(name: &str, specs: &[String]) -> Result<Manifest, GeneratorError
     // exact DDL rendering and pk_check.rs's classifier so `migrate new` and
     // `migrate apply` (which runs the same check over a hand-authored
     // manifest) agree byte-for-byte on what counts as the forbidden shape.
-    // The message is built here, once, from the raw findings -- routing
-    // through `pk_check::enforce`'s own rendered error would double the
-    // "Configuration error:" prefix once `run_new` wraps this error too.
+    // The message comes from `pk_check::render_refusals`, shared with
+    // `enforce`'s Refuse arm, so the two sites cannot drift. Routing through
+    // `enforce`'s rendered SyncError instead would double the "Configuration
+    // error:" prefix once `run_new` wraps this error too, which is why the
+    // renderer is shared and the error type is not.
     let refusals = crate::migrate::apply::rowid_alias_findings(&up);
     if !refusals.is_empty() {
-        let joined = refusals
-            .iter()
-            .map(|f| format!("[{}] {}", f.table, f.message))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(GeneratorError::RowidPrimaryKey(format!(
-            "incompatible primary key(s): {joined}"
-        )));
+        return Err(GeneratorError::RowidPrimaryKey(
+            crate::pk_check::render_refusals(&refusals),
+        ));
     }
 
     let down: Vec<ClassifiedOp> = down_forward_order

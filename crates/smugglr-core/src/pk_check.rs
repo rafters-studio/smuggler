@@ -7,13 +7,21 @@
 //! overwrites one with the other -- guaranteed cross-node data loss. See
 //! `docs/plans/migration.md` (Precondition).
 //!
-//! The design's end-state is a hard refusal, but for **0.5.0 the check WARNS and
-//! does not refuse** (Sean, 2026-07-18): the sanctioned remedy -- the in-tool
-//! `int -> UUIDv7` conversion (#280) -- is deferred to 0.5.x, so hard-refusing
-//! the onboarding user with no in-tool fix is worse than warning. Every warning
-//! therefore carries the manual UUIDv7 remigration recipe. The refusal is gated
-//! behind [`PkCheckPolicy`], which flips to [`PkCheckPolicy::Refuse`] in 0.5.x
-//! once #280 lands.
+//! **Which policy applies depends on whose DDL it is, and the two answers
+//! differ today.**
+//!
+//! For an EXISTING database -- the first-run check -- 0.5.0 WARNS and does not
+//! refuse (Sean, 2026-07-18): the sanctioned remedy, the in-tool
+//! `int -> UUIDv7` conversion (#280), is deferred to 0.5.x, so hard-refusing an
+//! onboarding user with no in-tool fix is worse than warning. Every warning
+//! therefore carries the manual UUIDv7 remigration recipe. That default flips to
+//! [`PkCheckPolicy::Refuse`] once #280 lands.
+//!
+//! For NEW DDL that smugglr is about to mint itself, `migrate new` and
+//! `migrate apply` already pass [`PkCheckPolicy::Refuse`] directly, in 0.5.0,
+//! with #280 unlanded (#427) -- because there the remedy exists and is one
+//! keystroke: write `id:pk`. So `Refuse` is NOT unreachable this release, and a
+//! maintainer reading only the paragraph above would conclude otherwise.
 //!
 //! Classification is **DDL-based and read-only**. `PRAGMA table_info` reports a
 //! rowid-alias `INTEGER PRIMARY KEY` and a non-alias `INTEGER PRIMARY KEY DESC`
@@ -128,6 +136,25 @@ pub enum PkCheckPolicy {
 /// [`PkCheckPolicy::Refuse`] any finding produces an `Err`. Per the design's
 /// build note the refusal reuses [`crate::error::SyncError::Config`] rather than
 /// adding a new variant.
+/// The refusal message both migrate refusal sites emit (#427).
+///
+/// Shared rather than duplicated. `migrate new` cannot route through
+/// [`enforce`]'s rendered `SyncError` -- `run_new` wraps its error again and the
+/// "Configuration error:" prefix would double -- so it renders the same findings
+/// itself. Before this function existed both sites carried their own copy of
+/// this format string and agreed only by coincidence, which review of #427
+/// flagged: a future edit to one would have silently diverged the scaffold-time
+/// message from the apply-time one, uncaught because the two are asserted with
+/// `contains`, never against each other.
+pub(crate) fn render_refusals(findings: &[PkFinding]) -> String {
+    let joined = findings
+        .iter()
+        .map(|f| format!("[{}] {}", f.table, f.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("incompatible primary key(s): {joined}")
+}
+
 pub fn enforce(findings: &[PkFinding], policy: PkCheckPolicy) -> crate::error::Result<()> {
     if findings.is_empty() {
         return Ok(());
@@ -143,16 +170,7 @@ pub fn enforce(findings: &[PkFinding], policy: PkCheckPolicy) -> crate::error::R
             }
             Ok(())
         }
-        PkCheckPolicy::Refuse => {
-            let joined = findings
-                .iter()
-                .map(|f| format!("[{}] {}", f.table, f.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            Err(crate::error::SyncError::Config(format!(
-                "incompatible primary key(s): {joined}"
-            )))
-        }
+        PkCheckPolicy::Refuse => Err(crate::error::SyncError::Config(render_refusals(findings))),
     }
 }
 

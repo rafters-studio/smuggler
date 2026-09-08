@@ -43,10 +43,17 @@ fn migrate_new_refuses_a_bare_integer_primary_key() {
         .output()
         .expect("run smugglr migrate new");
 
-    assert!(
-        !output.status.success(),
-        "id:int:pk must be refused, not scaffolded; exit status: {:?}",
-        output.status
+    // Exit 2, not merely non-zero: a refusal is a CONFIGURATION error in the
+    // documented 0-5 contract (`SyncError::exit_code`, and main.rs's
+    // after_help), which tells a scripted caller to fix the input rather than
+    // retry. Asserting only `!success()` would stay green if a future change
+    // collapsed this into the generic exit 1 -- review of #427 flagged that.
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "id:int:pk must be refused as a config error (exit 2); status: {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(
@@ -123,10 +130,14 @@ fn migrate_apply_refuses_a_hand_authored_rowid_alias_manifest() {
         .output()
         .expect("run smugglr migrate apply");
 
-    assert!(
-        !output.status.success(),
-        "a hand-authored rowid-alias manifest must be refused, not applied; exit status: {:?}",
-        output.status
+    // Exit 2 for the same reason as the scaffold refusal above: this is a
+    // configuration error, and the exit code is the scripting contract.
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a hand-authored rowid-alias manifest must be refused as a config error (exit 2); status: {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(
