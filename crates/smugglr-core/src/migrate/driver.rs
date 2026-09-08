@@ -18,12 +18,23 @@
 //!   -> refuse a rowid-alias / AUTOINCREMENT key (#427)
 //!   -> version = current_version + 1        (the DRIVER assigns it)
 //!   -> [optional reconcile preflight -- #290]
-//!   -> ledger.try_elect(version, checksum)
-//!   -> [only if Won]
+//!   -> elect_apply_settle(version, checksum, run = ||
 //!        lint_manifest + enforce_preimage
 //!        -> apply_ops(up, pre_op = capture_before)
-//!        -> ledger.mark_success   |   ledger.mark_failed on error
+//!      )
 //! ```
+//!
+//! Everything from `try_elect` through the settling `mark_success` /
+//! `mark_failed` (below) is [`elect_apply_settle`]'s skeleton, not repeated
+//! here inline. It has exactly two callers: [`apply_migration`], and
+//! [`apply_compensating`](crate::migrate::reverse::apply_compensating) in
+//! `reverse.rs`, which supplies its own `run` (`down_ops` / pre-image
+//! restore) and none of the guards above -- see that function's own doc for
+//! why each guard is not carried over (#463). That is what makes "there must
+//! never be a second forward-apply loop" (below) true of the code and not
+//! only the doc: the guards live once, in `apply_migration`; the
+//! claim-run-settle skeleton lives once, in `elect_apply_settle`; and
+//! `reverse.rs` composes the skeleton rather than reimplementing it.
 //!
 //! ## The ledger write is two-phase, and election runs BEFORE apply
 //!
@@ -53,7 +64,13 @@
 //! runnable: #273 ships D1 / Turso / rqlite as pure statement *generators*, and
 //! the host->target DDL transport is deferred to #291, which will build the
 //! programmatic embedder API **on** [`apply_migration`] rather than beside it.
-//! There must never be a second forward-apply loop.
+//! There must never be a second forward-apply loop -- and as of #463 that is
+//! enforced by extraction, not merely stated: the one claim-run-settle
+//! skeleton is [`elect_apply_settle`], [`apply_migration`] is its first
+//! caller, and [`apply_compensating`](crate::migrate::reverse::apply_compensating)
+//! is its second. A future third caller (#291's embedder, or a CLI wired
+//! onto reverse) composes the same skeleton rather than hand-rolling another
+//! copy of it.
 
 #![cfg(feature = "native")]
 
@@ -157,6 +174,74 @@ pub fn apply_migration_to_file(
     apply_migration(&conn, sealed, opts)
 }
 
+/// The shared claim-apply-settle skeleton behind both call sites of
+/// [`Ledger::try_elect`] in this crate: [`apply_migration`] below, and
+/// [`apply_compensating`](crate::migrate::reverse::apply_compensating).
+///
+/// Owns exactly the three-step skeleton the module doc's crash table depends
+/// on -- elect, run the caller's closure, settle (`mark_success` on `Ok`,
+/// best-effort `mark_failed` on `Err`, with the original error still
+/// returned either way) -- and nothing else. Election claims the version
+/// *before* `run` executes, for the same reason the module doc gives: every
+/// crash lands somewhere the ledger already describes.
+///
+/// This function is deliberately **not** where the guards that only make
+/// sense for a full authored manifest live: checksum verification
+/// ([`ChecksummedManifest::verify`]), [`Ledger::ensure_schema`], the
+/// `applied_version_of` already-applied short-circuit, the #427 rowid-alias
+/// refusal, or [`lint::lint_manifest`] / [`lint::enforce_preimage`].
+/// [`apply_migration`] runs all of those *before* calling this function,
+/// exactly as it did before this extraction.
+/// [`apply_compensating`](crate::migrate::reverse::apply_compensating) does
+/// not run them at all, and that omission predates this extraction and is
+/// deliberate, not an oversight this function should paper over: `down_ops`
+/// are the structural inverse of `up` ops that already passed lint when they
+/// applied forward, or a captured pre-image restore -- neither is fresh
+/// user-authored DDL, so re-running manifest-level gates on them is a
+/// separate design question (see that function's own doc for the reasoning,
+/// and #463's PR body for why each guard was or was not carried over).
+///
+/// Returns `(election, None)` when the election was not [`Election::Won`] --
+/// `run` never executes and nothing was mutated. Returns
+/// `(Election::Won, Some(value))` when `run` returned `Ok(value)`.
+#[cfg(feature = "native")]
+pub(crate) fn elect_apply_settle<T>(
+    conn: &Connection,
+    version: u64,
+    checksum: &str,
+    lease_secs: i64,
+    run: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<(Election, Option<T>)> {
+    let election = Ledger::try_elect(conn, version, checksum, lease_secs)?;
+    if election != Election::Won {
+        return Ok((election, None));
+    }
+
+    let attempt = run(conn);
+
+    // `mark_success` is folded INTO the funnel rather than run after it: see
+    // the module doc, "The ledger write is two-phase, and election runs
+    // BEFORE apply". A bare `?` here would leave the row `pending` with a
+    // live lease over a possibly-mutated database -- the abandoned-pending
+    // state this funnel exists to prevent.
+    let settled = attempt.and_then(|value| {
+        Ledger::mark_success(conn, version)?;
+        Ok(value)
+    });
+
+    match settled {
+        Ok(value) => Ok((election, Some(value))),
+        Err(e) => {
+            // Best-effort settle: leave the row `failed` (and so immediately
+            // reclaimable) rather than pending for the rest of the lease.
+            // The original error is what the caller sees -- if this settle
+            // also fails, the lease expiry is the backstop.
+            let _ = Ledger::mark_failed(conn, version);
+            Err(e)
+        }
+    }
+}
+
 /// Compose a full forward apply of `sealed` against a local connection.
 ///
 /// The composition, and why each step sits where it does:
@@ -172,14 +257,16 @@ pub fn apply_migration_to_file(
 ///    The version is the *driver's* to assign, not the manifest's: the
 ///    generator (#270) hardcodes `version: 1` on every manifest it scaffolds,
 ///    so honouring `manifest.version` would make every migration claim v1.
-/// 4. **Elect.** [`Ledger::try_elect`] is transaction-free and resolves the race
-///    on `UNIQUE(version)`, so this whole path is portable to a target with no
-///    interactive transactions.
-/// 5. **Only if won:** lint, then apply, then settle. Everything past the
-///    election funnels through one settle point, so *any* failure -- a lint
-///    refusal, a failed op, or a failed `mark_success` -- settles the claimed
-///    row as `failed` rather than abandoning it pending for a whole lease. Only
-///    process death escapes the funnel, and the lease expiry covers that.
+/// 4. **Elect, run, settle.** [`elect_apply_settle`] owns this step: it wraps
+///    [`Ledger::try_elect`] (transaction-free, resolves the race on
+///    `UNIQUE(version)`, so this whole path is portable to a target with no
+///    interactive transactions), runs the lint + apply closure only if the
+///    election is [`Election::Won`], and settles the row -- `mark_success` on
+///    `Ok`, `mark_failed` on `Err` -- so *any* failure past the election, a
+///    lint refusal, a failed op, or a failed `mark_success`, settles the
+///    claimed row as `failed` rather than abandoning it pending for a whole
+///    lease. Only process death escapes the funnel, and the lease expiry
+///    covers that.
 ///
 /// The lint runs once over the manifest (both of its gates are manifest-level),
 /// while pre-image capture rides the per-op `pre_op` write-ahead hook
@@ -207,7 +294,6 @@ pub fn apply_migration_to_file(
 /// -- after which the next honest reclaim orphans that successor's `prev_hash`
 /// and `verify_chain` reports tampering permanently. The ledger's own docs
 /// carry the sequence.
-///
 pub fn apply_migration(
     conn: &Connection,
     sealed: &ChecksummedManifest,
@@ -250,8 +336,13 @@ pub fn apply_migration(
     // a reversal to what it reversed, and adding a field to the reversed row is
     // exactly what the chain hash forbids. `apply_compensating` has no
     // production caller today, so this is a library-level regression rather than
-    // an operator-facing one -- and #274 will wire the CLI onto it, which is why
-    // #419 exists rather than a comment saying "future work".
+    // an operator-facing one -- #274 (closed) built `apply_compensating` and the
+    // rest of `reverse.rs`, but wired no CLI caller onto it, and no CLI caller is
+    // filed as a numbered issue yet (#463). Whoever files and builds one must
+    // route it through `elect_apply_settle` below, the shared skeleton both
+    // `apply_migration` and `apply_compensating` already call, rather than
+    // hand-roll a third claim-apply-settle loop -- which is why #419 exists
+    // rather than a comment saying "future work".
     if let Some(applied) = Ledger::applied_version_of(conn, &sealed.checksum)? {
         return Ok(ApplyOutcome {
             version: applied,
@@ -287,72 +378,54 @@ pub fn apply_migration(
         );
     }
 
-    let election = Ledger::try_elect(conn, version, &sealed.checksum, opts.lease_secs)?;
-    if election != Election::Won {
-        return Ok(ApplyOutcome {
-            version,
-            checksum: sealed.checksum.clone(),
-            election,
-            classifications: Vec::new(),
-            preimage: None,
-        });
-    }
+    // Apply is idempotent per-op, so a reclaimer re-driving these ops after a
+    // crash re-runs them as no-ops and settles `success` -- the one state that
+    // must never survive is a live lease nobody is holding, which is exactly
+    // what `elect_apply_settle`'s funnel guarantees.
+    let (election, applied) =
+        elect_apply_settle(conn, version, &sealed.checksum, opts.lease_secs, |conn| {
+            if opts.paranoid {
+                // Seam for #289: the `VACUUM INTO` snapshot lands here -- after
+                // the win, before the first mutation. Folded into the closure
+                // (rather than checked before calling `elect_apply_settle`)
+                // because it must fire only once the election is actually won.
+                warn!(
+                    version,
+                    "--paranoid requested but the pre-migration snapshot is not implemented \
+                     until #289; applying without a parachute"
+                );
+            }
 
-    if opts.paranoid {
-        // Seam for #289: the `VACUUM INTO` snapshot lands here -- after the win,
-        // before the first mutation.
-        warn!(
-            version,
-            "--paranoid requested but the pre-migration snapshot is not implemented until #289; \
-             applying without a parachute"
-        );
-    }
+            let classifications =
+                lint::lint_manifest(manifest).map_err(|e| MigrateError::Lint(e.to_string()))?;
+            lint::enforce_preimage(manifest).map_err(|e| MigrateError::Lint(e.to_string()))?;
 
-    let attempt = (|| -> Result<(Vec<Classification>, PreimagePayload)> {
-        let classifications =
-            lint::lint_manifest(manifest).map_err(|e| MigrateError::Lint(e.to_string()))?;
-        lint::enforce_preimage(manifest).map_err(|e| MigrateError::Lint(e.to_string()))?;
+            let mut capturer = PreimageCapturer::new();
+            {
+                let mut pre_op = |op: &ClassifiedOp| -> std::result::Result<(), MigrateError> {
+                    capturer.capture_before(conn, op)
+                };
+                apply_ops(conn, &manifest.up, &mut pre_op)?;
+            }
+            Ok((classifications, capturer.into_payload()))
+        })?;
 
-        let mut capturer = PreimageCapturer::new();
-        {
-            let mut pre_op = |op: &ClassifiedOp| -> std::result::Result<(), MigrateError> {
-                capturer.capture_before(conn, op)
-            };
-            apply_ops(conn, &manifest.up, &mut pre_op)?;
-        }
-        Ok((classifications, capturer.into_payload()))
-    })();
-
-    // `mark_success` is folded INTO the funnel rather than run after it: a bare
-    // `?` here would leave the row `pending` with a live lease over a fully
-    // mutated database -- the abandoned-pending state this funnel exists to
-    // prevent, and worse than the lint-refusal case, because here the ops
-    // actually ran. Settling `failed` instead is honest about *this run* not
-    // completing, not a claim that nothing applied: apply is idempotent per-op,
-    // so the reclaimer re-drives the ops as no-ops and settles `success`. The
-    // one state that must never survive is a live lease nobody is holding.
-    let settled = attempt.and_then(|applied| {
-        Ledger::mark_success(conn, version)?;
-        Ok(applied)
-    });
-
-    match settled {
-        Ok((classifications, payload)) => Ok(ApplyOutcome {
+    Ok(match applied {
+        Some((classifications, payload)) => ApplyOutcome {
             version,
             checksum: sealed.checksum.clone(),
             election,
             classifications,
             preimage: (!payload.is_empty()).then_some(payload),
-        }),
-        Err(e) => {
-            // Best-effort settle: leave the row `failed` (and so immediately
-            // reclaimable) rather than pending for the rest of the lease. The
-            // original error is what the caller sees -- if this settle also
-            // fails, the lease expiry is the backstop.
-            let _ = Ledger::mark_failed(conn, version);
-            Err(e)
-        }
-    }
+        },
+        None => ApplyOutcome {
+            version,
+            checksum: sealed.checksum.clone(),
+            election,
+            classifications: Vec::new(),
+            preimage: None,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -942,5 +1015,80 @@ mod tests {
         let outcome = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap();
         assert_eq!(outcome.election, Election::AlreadyApplied);
         assert_eq!(outcome.version, 1);
+    }
+
+    // -- #463: the shared elect_apply_settle funnel, pinned directly --------
+
+    /// [`elect_apply_settle`] is the one place both [`apply_migration`] (above)
+    /// and [`apply_compensating`](crate::migrate::reverse::apply_compensating)
+    /// (`reverse.rs`) get their claim-run-settle behavior from. Pinning it
+    /// here, on the shared function itself rather than only through each
+    /// caller's own tests, is the point: a future edit to this one copy that
+    /// broke the funnel for, say, `apply_compensating` alone would still pass
+    /// every `apply_migration` test above, because `apply_migration` never
+    /// exercises `apply_compensating`'s call site. A direct test on the
+    /// shared function is what actually protects both callers from drifting
+    /// apart again -- the failure mode #463 exists to close.
+    /// The success half of the same funnel: `run`'s value travels back out
+    /// untouched, and the row settles `success`.
+    #[test]
+    fn elect_apply_settle_returns_runs_value_and_settles_success_on_ok() {
+        let conn = conn();
+        Ledger::ensure_schema(&conn).unwrap();
+
+        let (election, applied) =
+            elect_apply_settle(&conn, 1, "c1", DEFAULT_LEASE_SECS, |_| Ok(42u32)).unwrap();
+
+        assert_eq!(election, Election::Won);
+        assert_eq!(applied, Some(42));
+        let entry = Ledger::entry(&conn, 1).unwrap().expect("ledger row");
+        assert_eq!(entry.status, MigrationStatus::Success);
+    }
+
+    /// A lost election never runs `run` at all, and reports `None`.
+    #[test]
+    fn elect_apply_settle_does_not_run_the_closure_when_the_election_is_lost() {
+        let conn = conn();
+        Ledger::ensure_schema(&conn).unwrap();
+        Ledger::try_elect(&conn, 1, "c1", DEFAULT_LEASE_SECS).unwrap();
+        Ledger::mark_success(&conn, 1).unwrap();
+
+        let ran = std::cell::Cell::new(false);
+        let (election, applied) = elect_apply_settle(&conn, 1, "c1", DEFAULT_LEASE_SECS, |_| {
+            ran.set(true);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(election, Election::AlreadyApplied);
+        assert_eq!(applied, None);
+        assert!(
+            !ran.get(),
+            "run must not execute when the election is not Won"
+        );
+    }
+
+    /// The failure half of the same funnel: `run` erroring settles the row
+    /// `failed` (immediately reclaimable), not `pending`, and the original
+    /// error is what the caller sees.
+    #[test]
+    fn elect_apply_settle_settles_failed_and_reelectable_on_a_run_error() {
+        let conn = conn();
+        Ledger::ensure_schema(&conn).unwrap();
+
+        let err = elect_apply_settle(&conn, 1, "c1", DEFAULT_LEASE_SECS, |_| {
+            Err::<(), _>(MigrateError::Apply("boom".into()).into())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("boom"));
+
+        let entry = Ledger::entry(&conn, 1).unwrap().expect("ledger row");
+        assert_eq!(entry.status, MigrationStatus::Failed);
+        assert_eq!(entry.lease_expires_at, None);
+        assert_eq!(
+            Ledger::try_elect(&conn, 1, "c1", DEFAULT_LEASE_SECS).unwrap(),
+            Election::Won,
+            "a failed row must be immediately reclaimable"
+        );
     }
 }
