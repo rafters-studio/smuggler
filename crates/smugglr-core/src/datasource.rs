@@ -121,6 +121,25 @@ pub trait DataSource: Sync {
         &self,
         table: &str,
     ) -> impl std::future::Future<Output = Result<usize>> + MaybeSend;
+
+    /// Names of the tables `table` declares a `FOREIGN KEY ... REFERENCES` to
+    /// -- its parents, which a write-ordered sync must land before `table`
+    /// itself on any target that enforces referential integrity (see
+    /// `sync::topological_table_order`, #435).
+    ///
+    /// Default is an empty list: only a source that can introspect a real
+    /// foreign-key graph overrides this (`LocalDb`, via SQLite's `PRAGMA
+    /// foreign_key_list`). A source that always returns `Ok(vec![])` simply
+    /// leaves write order at its alphabetical tiebreak -- the same order sync
+    /// produced before this method existed -- so `PluginDataSource`, the wasm
+    /// adapters, and third-party `DataSource` implementors are unaffected
+    /// unless they choose to override it.
+    fn foreign_key_parents(
+        &self,
+        _table: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<String>>> + MaybeSend {
+        async { Ok(Vec::new()) }
+    }
 }
 
 #[cfg(test)]
