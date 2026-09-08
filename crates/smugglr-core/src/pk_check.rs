@@ -156,6 +156,31 @@ pub fn enforce(findings: &[PkFinding], policy: PkCheckPolicy) -> crate::error::R
     }
 }
 
+/// Findings that new DDL must hard-refuse, rather than warn on: the
+/// rowid-alias `INTEGER PRIMARY KEY` and `AUTOINCREMENT`, and nothing else.
+///
+/// This is narrower than "every L1 shape finding". [`PkIssue::NoPrimaryKey`]
+/// is L1 too, but a table with no declared key at all is a different, softer
+/// problem than one that actively mints per-node sequential ids -- #427 scopes
+/// the hard-refusal to the shape its title names, the rowid alias (and its
+/// explicit `AUTOINCREMENT` cousin). L2 ([`PkIssue::NullablePrimaryKey`]) and
+/// L3 ([`PkIssue::DerivedVolatile`]) are excluded for the same reason: L3 is
+/// explicitly guidance, never a gate, and L2 flags a different failure than
+/// "mints a rowid alias".
+///
+/// Used by `migrate new` (scaffold time, #427) and `migrate apply` (before
+/// the driver claims a ledger version, #427) to hard-refuse **new** DDL
+/// smugglr is about to mint itself -- unlike an existing database (#280, a
+/// different issue), this has an in-tool remedy (write `id:pk`), so 0.5.0's
+/// "warn, no remedy" carve-out in [`enforce`] does not apply here.
+pub fn rowid_refusals(findings: &[PkFinding]) -> Vec<PkFinding> {
+    findings
+        .iter()
+        .filter(|f| matches!(f.issue, PkIssue::IntegerPrimaryKey | PkIssue::Autoincrement))
+        .cloned()
+        .collect()
+}
+
 /// Classify a single table from its declared `CREATE TABLE` DDL.
 ///
 /// Returns every finding (empty means the schema is compatible). This is the
@@ -1017,6 +1042,59 @@ mod tests {
             findings.is_empty(),
             "INTEGER PRIMARY KEY DESC must pass at the live sqlite_master level: {findings:?}"
         );
+    }
+
+    // --- rowid_refusals: the #427 hard-refuse scope --------------------------
+
+    #[test]
+    fn rowid_refusals_keeps_integer_primary_key_and_autoincrement() {
+        let findings = classify_table_ddl("t", "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        assert_eq!(
+            issues(&rowid_refusals(&findings)),
+            vec![PkIssue::IntegerPrimaryKey]
+        );
+
+        let findings =
+            classify_table_ddl("t", "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)");
+        assert_eq!(
+            issues(&rowid_refusals(&findings)),
+            vec![PkIssue::Autoincrement]
+        );
+    }
+
+    #[test]
+    fn rowid_refusals_drops_no_primary_key_and_l2_l3() {
+        // NoPrimaryKey: L1, but not the shape #427 hard-refuses.
+        let findings = classify_table_ddl("t", "CREATE TABLE t (a TEXT, b TEXT)");
+        assert!(rowid_refusals(&findings).is_empty());
+
+        // Nullable PK: L2, a different failure than "mints a rowid alias".
+        let findings = classify_table_ddl("t", "CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)");
+        assert!(rowid_refusals(&findings).is_empty());
+
+        // Derived-volatile: L3, guidance only, never a gate.
+        let findings = classify_table_ddl(
+            "games",
+            "CREATE TABLE games (game_hash TEXT NOT NULL PRIMARY KEY, v TEXT)",
+        );
+        assert!(rowid_refusals(&findings).is_empty());
+    }
+
+    #[test]
+    fn rowid_refusals_passes_composite_and_desc_and_clean_schemas() {
+        // #413's territory (DESC) and the composite-key acceptance case must
+        // both survive the filter untouched -- empty in, empty out.
+        let findings = classify_table_ddl(
+            "t",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY DESC NOT NULL, v TEXT)",
+        );
+        assert!(rowid_refusals(&findings).is_empty());
+
+        let findings = classify_table_ddl(
+            "t",
+            "CREATE TABLE t (a TEXT NOT NULL, b TEXT NOT NULL, PRIMARY KEY (a, b))",
+        );
+        assert!(rowid_refusals(&findings).is_empty());
     }
 
     #[test]

@@ -56,11 +56,12 @@
 #![cfg(feature = "native")]
 
 use crate::error::Result;
-use crate::migrate::apply::apply_ops;
+use crate::migrate::apply::{apply_ops, rowid_alias_findings};
 use crate::migrate::ledger::{Election, Ledger, DEFAULT_LEASE_SECS};
 use crate::migrate::lint::{self, Classification};
 use crate::migrate::reverse::{PreimageCapturer, PreimagePayload};
 use crate::migrate::{ChecksummedManifest, ClassifiedOp, MigrateError};
+use crate::pk_check::{self, PkCheckPolicy};
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 use tracing::warn;
@@ -259,6 +260,19 @@ pub fn apply_migration(
         });
     }
 
+    // Refuse a rowid-alias or AUTOINCREMENT primary key on any `create_table`
+    // op before a version is claimed (#427). Deliberately *after* the
+    // already-applied check above, not before it: a migration that minted
+    // this shape and genuinely succeeded before this fix shipped must stay a
+    // harmless no-op on re-run, not start failing an idempotent re-apply.
+    // This is new DDL smugglr is about to mint itself, so unlike an existing
+    // database (#280) there is an in-tool remedy: write `id:pk` (TEXT).
+    // `generator::generate` runs the same check at scaffold time; this is the
+    // second site, catching a hand-authored manifest that never passed
+    // through the generator.
+    let refusals = rowid_alias_findings(&manifest.up);
+    pk_check::enforce(&refusals, PkCheckPolicy::Refuse)?;
+
     let version = Ledger::current_version(conn)?.map_or(1, |v| v + 1);
 
     if opts.reconcile_preflight {
@@ -374,9 +388,16 @@ mod tests {
 
     /// `users` carries a real primary key: the delta-scoped pre-image capture
     /// keys its surgical restore on the PK and refuses a PK-less table.
+    ///
+    /// TEXT, not INTEGER (#427): every test below inserts an explicit `id`
+    /// value and never an omitted-key insert or `last_insert_rowid()`, so
+    /// nothing here exercises rowid-alias semantics -- this helper minting a
+    /// bare `INTEGER PRIMARY KEY` was itself the exact shape #427 forbids,
+    /// which is part of why the driver applied it uncaught before that fix.
     fn create_users() -> ClassifiedOp {
-        let mut id = col("id", ColumnKind::Int);
+        let mut id = col("id", ColumnKind::Text);
         id.constraints.push(Constraint::Pk);
+        id.constraints.push(Constraint::NotNull);
         ClassifiedOp::new(Op::CreateTable {
             table: "users".into(),
             columns: vec![id, col("email", ColumnKind::Text)],
@@ -609,8 +630,12 @@ mod tests {
         // happen if the hook ran first. Two destructive ops give one capture
         // each, in apply order, which is the per-op part.
         let conn = conn();
-        let mut id = col("id", ColumnKind::Int);
+        // TEXT, not INTEGER (#427): the insert below supplies an explicit id
+        // and never reads it back, so nothing here depends on rowid-alias
+        // semantics -- see create_users' doc for the same reasoning.
+        let mut id = col("id", ColumnKind::Text);
         id.constraints.push(Constraint::Pk);
+        id.constraints.push(Constraint::NotNull);
         apply_migration(
             &conn,
             &manifest_with(
@@ -629,7 +654,7 @@ mod tests {
         )
         .unwrap();
         conn.execute_batch(
-            "INSERT INTO users (id, email, phone) VALUES (1, 'a@example.com', '555-0100');",
+            "INSERT INTO users (id, email, phone) VALUES ('1', 'a@example.com', '555-0100');",
         )
         .unwrap();
 
@@ -797,7 +822,7 @@ mod tests {
             &ApplyOptions::default(),
         )
         .unwrap();
-        conn.execute_batch("INSERT INTO users (id, email) VALUES (1, 'a@example.com');")
+        conn.execute_batch("INSERT INTO users (id, email) VALUES ('1', 'a@example.com');")
             .unwrap();
 
         let sealed = manifest_with(
@@ -847,5 +872,73 @@ mod tests {
         // The ledger schema exists only if `ensure_schema` ran; verification is
         // ahead of it, so nothing was created and nothing was claimed.
         assert!(Ledger::current_version(&conn).is_err());
+    }
+
+    // -- #427: refuse a rowid-alias primary key before claiming a version ---
+
+    #[test]
+    fn apply_migration_refuses_a_rowid_alias_manifest_before_claiming_a_version() {
+        // The driver -- not just the CLI or the generator -- must refuse a
+        // hand-authored manifest carrying the rowid alias, and must do it
+        // before `Ledger::try_elect` ever claims a version.
+        let conn = conn();
+        let mut id = col("id", ColumnKind::Int);
+        id.constraints.push(Constraint::Pk);
+        let sealed = manifest_with(
+            vec![ClassifiedOp::new(Op::CreateTable {
+                table: "things".into(),
+                columns: vec![id, col("name", ColumnKind::Text)],
+                without_rowid: false,
+            })],
+            None,
+        );
+
+        let err = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("INTEGER PRIMARY KEY") || msg.contains("rowid"),
+            "must name the rowid-alias shape: {msg}"
+        );
+        assert!(
+            !table_exists(&conn, "things"),
+            "the refused table must not exist"
+        );
+        // No version was ever claimed: `ensure_schema` ran ahead of this
+        // check (so the ledger table may exist), but nothing is recorded in
+        // it.
+        assert_eq!(Ledger::current_version(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn a_migration_already_applied_before_427_stays_a_harmless_reapply() {
+        // A migration that minted the forbidden shape and genuinely
+        // succeeded before this fix shipped must not start failing an
+        // idempotent re-apply of the identical manifest -- only a NEW claim
+        // is refused. Simulates that pre-#427 history directly through the
+        // ledger (bypassing `apply_migration`, which would now refuse the
+        // manifest outright) -- exactly the row a node upgraded from before
+        // this fix would already be carrying.
+        let conn = conn();
+        let mut id = col("id", ColumnKind::Int);
+        id.constraints.push(Constraint::Pk);
+        let sealed = manifest_with(
+            vec![ClassifiedOp::new(Op::CreateTable {
+                table: "legacy_things".into(),
+                columns: vec![id, col("name", ColumnKind::Text)],
+                without_rowid: false,
+            })],
+            None,
+        );
+
+        Ledger::ensure_schema(&conn).unwrap();
+        assert_eq!(
+            Ledger::try_elect(&conn, 1, &sealed.checksum, DEFAULT_LEASE_SECS).unwrap(),
+            Election::Won
+        );
+        Ledger::mark_success(&conn, 1).unwrap();
+
+        let outcome = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap();
+        assert_eq!(outcome.election, Election::AlreadyApplied);
+        assert_eq!(outcome.version, 1);
     }
 }

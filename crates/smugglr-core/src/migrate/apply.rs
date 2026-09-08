@@ -199,6 +199,48 @@ fn render_create_table(table: &str, columns: &[Column], without_rowid: bool) -> 
     s
 }
 
+/// Find every `create_table` op in a manifest that would mint a SQLite
+/// rowid-alias or `AUTOINCREMENT` primary key (#427).
+///
+/// Renders each `create_table` op's DDL exactly as apply would emit it --
+/// reusing [`render_create_table`], never a second lowering -- and runs it
+/// through [`crate::pk_check::classify_table_ddl`]'s L1 shape check, keeping
+/// only the two findings [`crate::pk_check::rowid_refusals`] scopes to (the
+/// rowid alias and `AUTOINCREMENT`; `NoPrimaryKey` and the L2/L3 findings are
+/// deliberately not gated here -- see that function's doc). An empty result
+/// means the manifest is clean.
+///
+/// Returns raw findings rather than an enforced error so each caller renders
+/// its own message once: [`crate::migrate::generator::generate`] (scaffold
+/// time) folds a non-empty result into its own `GeneratorError`, and the
+/// `migrate apply` CLI entry (run before the driver claims a ledger version)
+/// passes it straight to [`crate::pk_check::enforce`]. Wrapping an already-
+/// rendered [`crate::pk_check::enforce`] error a second time here would double
+/// the "Configuration error:" prefix on the generator path.
+///
+/// Shared by both call sites so a hand-authored manifest that never passed
+/// through the generator is still caught -- the second refusal site the
+/// issue requires. Unlike an existing database (#280, a different issue, out
+/// of scope here), this is **new** DDL smugglr is about to mint itself, so
+/// `pk_check.rs`'s 0.5.0 "warn, no in-tool remedy" carve-out does not apply:
+/// the remedy is to write `id:pk` (TEXT), and both callers hard-refuse rather
+/// than warn.
+pub fn rowid_alias_findings(ops: &[ClassifiedOp]) -> Vec<crate::pk_check::PkFinding> {
+    let mut findings = Vec::new();
+    for classified in ops {
+        if let Op::CreateTable {
+            table,
+            columns,
+            without_rowid,
+        } = &classified.op
+        {
+            let ddl = render_create_table(table, columns, *without_rowid);
+            findings.extend(crate::pk_check::classify_table_ddl(table, &ddl));
+        }
+    }
+    crate::pk_check::rowid_refusals(&findings)
+}
+
 /// Render the single SQL statement for one op.
 ///
 /// This is the one-statement lowering shared by the native simple-op path and
@@ -2296,6 +2338,65 @@ mod tests {
             sql,
             "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_t_a\" ON \"t\" (\"a\", \"b\")"
         );
+    }
+
+    // -- rowid_alias_findings (#427) -----------------------------------------
+
+    #[test]
+    fn finds_a_bare_integer_primary_key() {
+        let mut id = col("id", ColumnKind::Int);
+        id.constraints.push(Constraint::Pk);
+        let ops = vec![ClassifiedOp::new(Op::CreateTable {
+            table: "things".into(),
+            columns: vec![id, col("name", ColumnKind::Text)],
+            without_rowid: false,
+        })];
+        let findings = rowid_alias_findings(&ops);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].table, "things");
+        assert!(
+            findings[0].message.contains("INTEGER PRIMARY KEY")
+                || findings[0].message.contains("rowid"),
+            "must name the rowid-alias shape: {}",
+            findings[0].message
+        );
+        assert!(
+            findings[0].message.contains("UUIDv7"),
+            "must carry the remedy: {}",
+            findings[0].message
+        );
+    }
+
+    #[test]
+    fn finds_nothing_for_a_text_primary_key() {
+        let mut id = col("id", ColumnKind::Text);
+        id.constraints.push(Constraint::Pk);
+        id.constraints.push(Constraint::NotNull);
+        let ops = vec![ClassifiedOp::new(Op::CreateTable {
+            table: "things".into(),
+            columns: vec![id, col("name", ColumnKind::Text)],
+            without_rowid: false,
+        })];
+        assert!(rowid_alias_findings(&ops).is_empty());
+    }
+
+    #[test]
+    fn ignores_non_create_table_ops() {
+        // A CreateIndex or AddColumn op carries no table shape to classify --
+        // must not panic or misfire on them.
+        let ops = vec![
+            ClassifiedOp::new(Op::CreateIndex {
+                name: "idx_t_a".into(),
+                table: "t".into(),
+                columns: vec!["a".into()],
+                unique: false,
+            }),
+            ClassifiedOp::new(Op::AddColumn {
+                table: "t".into(),
+                column: col("nickname", ColumnKind::Int),
+            }),
+        ];
+        assert!(rowid_alias_findings(&ops).is_empty());
     }
 
     // -- Remote generators (pure, no transport) -----------------------------

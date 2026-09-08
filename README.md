@@ -262,7 +262,7 @@ $ smugglr migrate apply migrations/create_bribes.json --db ./westwind.db
 Migration v9 is already applied -- nothing to do
 ```
 
-The ledger, `_smugglr_migrations`, assigns the version as `current + 1`, claims it before the first op runs, and settles it after; each op is idempotent, so an apply interrupted midway converges on re-run. What 0.5.0 does not do: no reverse from the CLI, no recovery snapshot (`--paranoid` warns, #289), local SQLite only (#291), no `int -> UUIDv7` conversion (#280), and `migrate new` does not yet refuse an explicit `int:pk` (#427).
+The ledger, `_smugglr_migrations`, assigns the version as `current + 1`, claims it before the first op runs, and settles it after; each op is idempotent, so an apply interrupted midway converges on re-run. What 0.5.0 does not do: no reverse from the CLI, no recovery snapshot (`--paranoid` warns, #289), local SQLite only (#291), no `int -> UUIDv7` conversion (#280). Both `migrate new` and `migrate apply` refuse an explicit `int:pk` -- the SQLite rowid alias -- rather than mint it; the remedy is `id:pk` (TEXT).
 
 ## Browser and Node
 
