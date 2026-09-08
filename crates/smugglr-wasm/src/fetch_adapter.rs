@@ -5,7 +5,7 @@
 
 use smugglr_core::config::DuplicatePkPolicy;
 use smugglr_core::datasource::{DataSource, RowMeta, TableInfo};
-use smugglr_core::error::{HttpRetryClass, Result, SyncError};
+use smugglr_core::error::{Result, SyncError};
 use smugglr_core::profile::{AuthFormat, Profile};
 use std::collections::HashMap;
 
@@ -128,20 +128,23 @@ impl FetchDataSource {
             // The same shape produced #436. Classifying here closes the gap;
             // collapsing the two adapters is the actual fix and is not this
             // change's job.
-            return Err(match smugglr_core::error::http_retry_class(status) {
-                HttpRetryClass::RateLimited => SyncError::RateLimited {
-                    // Absent Retry-After the engine falls back to its configured
-                    // backoff, so `None` still retries rather than failing.
-                    retry_after: resp
-                        .headers()
-                        .get("retry-after")
-                        .ok()
-                        .flatten()
-                        .and_then(|v| v.parse::<u64>().ok()),
-                },
-                HttpRetryClass::Transient => SyncError::ServerError { status, message },
-                HttpRetryClass::Permanent => SyncError::Remote(message),
-            });
+            // A malformed or absent Retry-After collapses to None rather than
+            // failing: the engine then falls back to its configured backoff, so
+            // the request still retries.
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok());
+
+            return Err(
+                smugglr_core::error::http_retry_class(status).into_sync_error(
+                    status,
+                    message,
+                    retry_after,
+                ),
+            );
         }
 
         let json_promise = resp
