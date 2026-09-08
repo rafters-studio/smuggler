@@ -79,74 +79,25 @@ impl HttpSqlAdapter {
             .map_err(|e| PluginError::new(format!("Failed to parse response JSON: {}", e)))
     }
 
+    /// Rows for a response, delegated to the profile (#436).
+    ///
+    /// This and `extract_columns` were byte-identical copies here and in the
+    /// wasm fetch adapter, which is why the d1 column-source defect broke both
+    /// paths at once. One implementation now, in `Profile`.
     fn extract_rows(
         &self,
         response: &Value,
         columns: &[String],
     ) -> Result<Vec<Vec<Value>>, PluginError> {
-        let rows_val = Profile::extract_path(response, &self.profile.rows_path)
-            .ok_or_else(|| PluginError::new("rows not found in response"))?;
-
-        match rows_val.as_array() {
-            Some(arr) => Ok(arr
-                .iter()
-                .map(|row| {
-                    if let Some(arr) = row.as_array() {
-                        arr.clone()
-                    } else if let Some(obj) = row.as_object() {
-                        // Extract values in column order for consistency
-                        columns
-                            .iter()
-                            .map(|c| obj.get(c).cloned().unwrap_or(Value::Null))
-                            .collect()
-                    } else {
-                        vec![row.clone()]
-                    }
-                })
-                .collect()),
-            None => Ok(vec![]),
-        }
+        self.profile
+            .extract_rows(response, columns)
+            .ok_or_else(|| PluginError::new("rows not found in response"))
     }
 
     fn extract_columns(&self, response: &Value) -> Result<Vec<String>, PluginError> {
-        // Try the configured columns_path first
-        if let Some(cols_val) = Profile::extract_path(response, &self.profile.columns_path) {
-            if let Some(arr) = cols_val.as_array() {
-                // If array contains strings or {name: ...} objects, use them
-                let names: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| {
-                        if let Some(s) = v.as_str() {
-                            Some(s.to_string())
-                        } else if let Some(obj) = v.as_object() {
-                            obj.get("name").and_then(|n| n.as_str()).map(String::from)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                if !names.is_empty() {
-                    return Ok(names);
-                }
-
-                // If rows are objects, extract column names from the first row
-                if let Some(first) = arr.first().and_then(|v| v.as_object()) {
-                    return Ok(first.keys().cloned().collect());
-                }
-            }
-        }
-
-        // Fallback: extract columns from the first row object at rows_path
-        if let Some(rows_val) = Profile::extract_path(response, &self.profile.rows_path) {
-            if let Some(arr) = rows_val.as_array() {
-                if let Some(first) = arr.first().and_then(|v| v.as_object()) {
-                    return Ok(first.keys().cloned().collect());
-                }
-            }
-        }
-
-        Err(PluginError::new("columns not found in response"))
+        self.profile
+            .extract_columns(response)
+            .ok_or_else(|| PluginError::new("columns not found in response"))
     }
 
     /// Maximum rows per batch for a given column count and bind param limit.
@@ -1017,5 +968,120 @@ mod d1_target_reaches_d1 {
             Some(endpoint.trim_start_matches("http://"))
         );
         assert_eq!(captured.authorization.as_deref(), Some("Bearer tok"));
+    }
+}
+
+#[cfg(test)]
+mod d1_table_discovery {
+    use super::*;
+    use smugglr_core::config::d1_plugin_config;
+
+    /// Cloudflare's documented D1 query response, wrapping `rows`.
+    ///
+    /// Derived from Cloudflare's published response format, NOT captured from a
+    /// live database -- this repository has no D1 account or token. #436 asks
+    /// for recorded responses from the live service; see the PR body, where that
+    /// gap is stated rather than papered over.
+    fn d1_body(rows: &str) -> String {
+        format!(
+            r#"{{"result":[{{"results":{},"success":true}}],"success":true,"errors":[],"messages":[]}}"#,
+            rows
+        )
+    }
+
+    /// A real adapter, initialized against a capture endpoint, then driven
+    /// through one discovery call. `initialize` itself issues `SELECT 1`, so the
+    /// endpoint must answer twice.
+    async fn d1_adapter_against(bodies: Vec<String>) -> HttpSqlAdapter {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read back the bound port");
+
+        tokio::spawn(async move {
+            let deadline = std::time::Duration::from_secs(10);
+            for body in bodies {
+                let Ok(Ok((mut socket, _))) =
+                    tokio::time::timeout(deadline, listener.accept()).await
+                else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let Ok(Ok(n)) = tokio::time::timeout(deadline, socket.read(&mut chunk)).await
+                    else {
+                        return;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        let mut plugin_config = d1_plugin_config("acct", "db", "tok", None);
+        plugin_config.insert("url".to_string(), format!("http://{}", addr));
+
+        let mut adapter = HttpSqlAdapter::new();
+        adapter
+            .initialize(plugin_config)
+            .await
+            .expect("initialize must reach the endpoint");
+        adapter
+    }
+
+    #[tokio::test]
+    async fn list_tables_reports_the_tables_d1_reports() {
+        // #436, end to end on the plugin path: before the fix the table names
+        // were read as the COLUMN list and list_tables returned nothing usable,
+        // so `smugglr status` against D1 could not name a single table.
+        let adapter = d1_adapter_against(vec![
+            d1_body(r#"[{"1":1}]"#),
+            d1_body(r#"[{"name":"customers"},{"name":"orders"}]"#),
+        ])
+        .await;
+
+        let tables = adapter.list_tables().await.expect("list_tables");
+        assert_eq!(
+            tables,
+            vec!["customers".to_string(), "orders".to_string()],
+            "the rows of the sqlite_master listing are the table names"
+        );
+    }
+
+    #[tokio::test]
+    async fn table_info_finds_the_primary_key_d1_reports() {
+        // The second half of discovery. A table whose primary key is not found
+        // is refused by sync (#332), so this is what stood between a working
+        // config and a push.
+        let adapter = d1_adapter_against(vec![
+            d1_body(r#"[{"1":1}]"#),
+            d1_body(
+                r#"[{"cid":0,"name":"id","type":"TEXT","notnull":1,"dflt_value":null,"pk":1},
+                    {"cid":1,"name":"updated_at","type":"INTEGER","notnull":0,"dflt_value":null,"pk":0}]"#,
+            ),
+        ])
+        .await;
+
+        let info = adapter.table_info("customers").await.expect("table_info");
+        assert_eq!(info.primary_key, vec!["id".to_string()]);
+        assert_eq!(info.columns.len(), 2);
+        assert_eq!(info.columns[0].name, "id");
+        assert!(info.columns[0].pk);
+        assert!(!info.columns[1].pk);
     }
 }

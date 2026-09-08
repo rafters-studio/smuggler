@@ -17,8 +17,8 @@ pub struct Profile {
     pub request_format: RequestFormat,
     /// JSON path to extract rows from the response
     pub rows_path: Vec<String>,
-    /// JSON path to extract column names from the response
-    pub columns_path: Vec<String>,
+    /// Where this backend's column names come from
+    pub columns: ColumnSource,
     /// Maximum bind parameters per query (0 = no limit)
     pub max_bind_params: usize,
 }
@@ -28,6 +28,29 @@ pub enum AuthFormat {
     Bearer,
     Basic,
     None,
+}
+
+/// Where a backend's column names come from (#436).
+///
+/// This used to be a bare `columns_path`, and every profile had to point it
+/// somewhere. D1 has no column list in its response, so `Profile::d1` aimed it
+/// at the ROWS -- and the extractor's "an object with a `name` key is a column
+/// descriptor" rule then read `[{"name":"users"},{"name":"posts"}]`, the rows of
+/// `SELECT name FROM sqlite_master`, as the column list `["users","posts"]`.
+/// Table discovery against D1 has been broken on every path since 0.4.0 because
+/// a "no column list" backend had no way to say so.
+///
+/// Naming the source makes that inexpressible: a profile either points at real
+/// descriptors or declares it has none.
+#[derive(Debug, Clone)]
+pub enum ColumnSource {
+    /// A JSON path to a list of column names or `{"name": ...}` descriptors.
+    /// rqlite, Turso and Datasette all send one.
+    Path(Vec<String>),
+    /// The backend sends no column list; take the keys of the first row object,
+    /// in the order the response carries them. D1 and any other row-objects
+    /// backend.
+    FirstRowKeys,
 }
 
 #[derive(Debug, Clone)]
@@ -72,13 +95,13 @@ impl Profile {
                 "result".into(),
                 "rows".into(),
             ],
-            columns_path: vec![
+            columns: ColumnSource::Path(vec![
                 "results".into(),
                 "0".into(),
                 "response".into(),
                 "result".into(),
                 "cols".into(),
-            ],
+            ]),
             max_bind_params: 0,
         }
     }
@@ -88,7 +111,7 @@ impl Profile {
             auth_format: AuthFormat::Basic,
             request_format: RequestFormat::Rqlite,
             rows_path: vec!["results".into(), "0".into(), "values".into()],
-            columns_path: vec!["results".into(), "0".into(), "columns".into()],
+            columns: ColumnSource::Path(vec!["results".into(), "0".into(), "columns".into()]),
             max_bind_params: 0,
         }
     }
@@ -98,7 +121,11 @@ impl Profile {
             auth_format: AuthFormat::Bearer,
             request_format: RequestFormat::Generic,
             rows_path: vec!["result".into(), "0".into(), "results".into()],
-            columns_path: vec!["result".into(), "0".into(), "results".into()],
+            // D1 sends no column list -- `result[0].results` is an array of row
+            // OBJECTS and there is nothing else to point at. Aiming
+            // `columns_path` here was the #436 defect: the rows of `SELECT name
+            // FROM sqlite_master` look exactly like column descriptors.
+            columns: ColumnSource::FirstRowKeys,
             max_bind_params: 100,
         }
     }
@@ -122,7 +149,7 @@ impl Profile {
             auth_format: AuthFormat::Bearer,
             request_format: RequestFormat::Datasette,
             rows_path: vec!["rows".into()],
-            columns_path: vec!["columns".into()],
+            columns: ColumnSource::Path(vec!["columns".into()]),
             max_bind_params: 0,
         }
     }
@@ -132,7 +159,7 @@ impl Profile {
             auth_format: AuthFormat::Bearer,
             request_format: RequestFormat::Generic,
             rows_path: vec!["data".into()],
-            columns_path: vec!["columns".into()],
+            columns: ColumnSource::Path(vec!["columns".into()]),
             max_bind_params: 0,
         }
     }
@@ -142,7 +169,7 @@ impl Profile {
             auth_format: AuthFormat::Bearer,
             request_format: RequestFormat::Generic,
             rows_path: vec!["result".into()],
-            columns_path: vec!["columns".into()],
+            columns: ColumnSource::Path(vec!["columns".into()]),
             max_bind_params: 0,
         }
     }
@@ -152,7 +179,7 @@ impl Profile {
             auth_format: AuthFormat::Bearer,
             request_format: RequestFormat::Generic,
             rows_path: vec!["rows".into()],
-            columns_path: vec!["columns".into()],
+            columns: ColumnSource::Path(vec!["columns".into()]),
             max_bind_params: 0,
         }
     }
@@ -164,9 +191,99 @@ impl Profile {
             auth_format: AuthFormat::Bearer,
             request_format: RequestFormat::Generic,
             rows_path: vec!["rows".into()],
-            columns_path: vec!["columns".into()],
+            columns: ColumnSource::Path(vec!["columns".into()]),
             max_bind_params: 0,
         }
+    }
+
+    /// The column names for a response, by this profile's own rule (#436).
+    ///
+    /// Lives here rather than in each adapter because the http-sql plugin and
+    /// the wasm fetch adapter carried byte-identical copies of this logic, which
+    /// is why #436 broke both paths at once and why fixing it in one would have
+    /// left the other wrong.
+    ///
+    /// The "an object with a `name` key is a column descriptor" rule applies
+    /// ONLY to [`ColumnSource::Path`], where the profile has asserted the path
+    /// really holds descriptors. Under [`ColumnSource::FirstRowKeys`] the same
+    /// bytes are row data and are read as such.
+    pub fn extract_columns(&self, response: &Value) -> Option<Vec<String>> {
+        match &self.columns {
+            ColumnSource::Path(path) => {
+                // Every miss falls through to the rows: a path that resolves to
+                // nothing, a path that resolves to a non-array, and a path whose
+                // array holds neither names nor descriptors. All three are cases
+                // the two adapter copies handled before this logic moved here,
+                // and `?`-chaining the first two out of the function was a
+                // regression review caught -- a Datasette response carrying
+                // `rows` but no `columns` went from a successful read to
+                // "columns not found in response".
+                let names = Self::extract_path(response, path)
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| {
+                                if let Some(s) = v.as_str() {
+                                    Some(s.to_string())
+                                } else {
+                                    v.as_object()?
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .map(String::from)
+                                }
+                            })
+                            .collect::<Vec<String>>()
+                    })
+                    .unwrap_or_default();
+
+                if !names.is_empty() {
+                    return Some(names);
+                }
+                // An empty column list would silently produce zero-width rows,
+                // so the rows decide instead.
+                self.first_row_keys(response)
+            }
+            ColumnSource::FirstRowKeys => self.first_row_keys(response),
+        }
+    }
+
+    /// The keys of the first row object at `rows_path`, in response order.
+    ///
+    /// `serde_json` preserves object key order only with its `preserve_order`
+    /// feature; without it the order is the map's, which is why every consumer
+    /// reads values BY NAME (`extract_rows` looks each column up in the object)
+    /// rather than by position. The order here decides display, not binding.
+    fn first_row_keys(&self, response: &Value) -> Option<Vec<String>> {
+        let arr = Self::extract_path(response, &self.rows_path)?.as_array()?;
+        let first = arr.first()?.as_object()?;
+        Some(first.keys().cloned().collect())
+    }
+
+    /// The rows for a response, as values in `columns` order.
+    ///
+    /// Shared for the same reason as [`Profile::extract_columns`]: two identical
+    /// copies is how one path gets fixed and the other does not.
+    pub fn extract_rows(&self, response: &Value, columns: &[String]) -> Option<Vec<Vec<Value>>> {
+        let rows_val = Self::extract_path(response, &self.rows_path)?;
+        let Some(arr) = rows_val.as_array() else {
+            return Some(vec![]);
+        };
+        Some(
+            arr.iter()
+                .map(|row| {
+                    if let Some(arr) = row.as_array() {
+                        arr.clone()
+                    } else if let Some(obj) = row.as_object() {
+                        columns
+                            .iter()
+                            .map(|c| obj.get(c).cloned().unwrap_or(Value::Null))
+                            .collect()
+                    } else {
+                        vec![row.clone()]
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// Build the request body for a SQL query.
@@ -397,6 +514,275 @@ mod tests {
         // at the top level. Verify the profile points there.
         let p = Profile::http_sql();
         assert_eq!(p.rows_path, vec!["rows".to_string()]);
-        assert_eq!(p.columns_path, vec!["columns".to_string()]);
+        let ColumnSource::Path(cols) = &p.columns else {
+            panic!("http-sql sends a real column list; it must be a Path source");
+        };
+        assert_eq!(cols, &vec!["columns".to_string()]);
+    }
+
+    /// The #436 defect, as the response D1 actually sends.
+    ///
+    /// `SELECT name FROM sqlite_master` returns rows that are indistinguishable
+    /// from column descriptors: objects with a single `name` key. Under the old
+    /// `columns_path == rows_path` aliasing the extractor read them as the
+    /// column list, so `list_tables` produced the table names as COLUMNS and
+    /// then read the rows against that list. Table discovery could not start.
+    mod d1_reads_its_own_responses {
+        use super::*;
+
+        /// A response recorded from a real D1 database.
+        ///
+        /// The four files under `tests/fixtures/d1/` were captured with
+        /// wrangler's local D1 -- the same engine Cloudflare runs, reached
+        /// through Miniflare rather than the REST endpoint, so no account or
+        /// token is needed. That directory's README records the exact commands
+        /// and states what these do and do not prove. Reading them from disk
+        /// rather than inlining them is deliberate: a fixture that can be
+        /// hand-edited to match the code is not a recording.
+        fn recorded(name: &str) -> Value {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/d1/");
+            let text = std::fs::read_to_string(format!("{dir}{name}.json"))
+                .unwrap_or_else(|e| panic!("recorded fixture {name}: {e}"));
+            serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("fixture {name} is not JSON: {e}"))
+        }
+
+        /// A response in the recorded envelope, for shapes that probe reader
+        /// behavior D1 does not currently produce (an empty result, a row
+        /// missing a key). Those are about how the READER must behave, so they
+        /// are constructed rather than recorded, and say so.
+        fn constructed(rows: Value) -> Value {
+            serde_json::json!({
+                "result": [{ "results": rows, "success": true, "meta": {"duration": 0} }],
+                "errors": [],
+                "messages": [],
+                "success": true
+            })
+        }
+
+        #[test]
+        fn a_table_listing_yields_table_names_as_rows_not_as_columns() {
+            let response = recorded("sqlite_master_listing");
+            let p = Profile::d1();
+
+            let columns = p.extract_columns(&response).expect("columns");
+            assert_eq!(
+                columns,
+                vec!["name".to_string()],
+                "the only column is `name`; `customers` and `orders` are VALUES"
+            );
+
+            let rows = p.extract_rows(&response, &columns).expect("rows");
+            assert_eq!(
+                rows,
+                vec![vec![Value::from("customers")], vec![Value::from("orders")],],
+                "each table name must arrive as a row, which is what list_tables reads"
+            );
+        }
+
+        #[test]
+        fn pragma_table_info_keeps_its_primary_key_flag() {
+            // table_info reads `name`, `type`, `notnull` and `pk` by position in
+            // the column list. The old aliasing read the ROWS as descriptors, so
+            // the column list became the column NAMES and every lookup missed --
+            // yielding a table with no primary key, which sync refuses.
+            let response = recorded("pragma_table_info");
+            let p = Profile::d1();
+
+            let columns = p.extract_columns(&response).expect("columns");
+            assert!(columns.contains(&"pk".to_string()), "got {columns:?}");
+            assert!(columns.contains(&"name".to_string()), "got {columns:?}");
+
+            let rows = p.extract_rows(&response, &columns).expect("rows");
+            let pk_idx = columns.iter().position(|c| c == "pk").expect("pk column");
+            let name_idx = columns
+                .iter()
+                .position(|c| c == "name")
+                .expect("name column");
+            assert_eq!(rows[0][pk_idx], Value::from(1));
+            assert_eq!(rows[0][name_idx], Value::from("id"));
+            assert_eq!(rows[1][pk_idx], Value::from(0));
+        }
+
+        #[test]
+        fn an_empty_result_set_is_not_an_error() {
+            // No first row means no keys to read. This must not be mistaken for
+            // a parse failure -- an empty table is ordinary.
+            let response = constructed(serde_json::json!([]));
+            let p = Profile::d1();
+            assert_eq!(p.extract_columns(&response), None);
+            assert_eq!(p.extract_rows(&response, &[]), Some(vec![]));
+        }
+
+        #[test]
+        fn the_metadata_select_keeps_its_pk_and_timestamp() {
+            // The third shape the adapter sends: `SELECT <pk> AS __pk,
+            // updated_at, ... FROM t`. Read against the wrong column list this
+            // yields no `__pk` and every row is skipped as unkeyed.
+            let response = recorded("metadata_select");
+            let p = Profile::d1();
+            let columns = p.extract_columns(&response).expect("columns");
+            assert!(columns.contains(&"__pk".to_string()), "got {columns:?}");
+
+            let rows = p.extract_rows(&response, &columns).expect("rows");
+            let pk = columns.iter().position(|c| c == "__pk").expect("__pk");
+            assert_eq!(rows[0][pk], Value::from("a-uuid"));
+            assert_eq!(rows[1][pk], Value::from("b-uuid"));
+        }
+
+        #[test]
+        fn a_row_fetch_carries_every_column_including_nulls() {
+            // The fourth shape: the full row fetch. A NULL must arrive as NULL
+            // rather than as a missing column, because the row is rebuilt by
+            // NAME from the column list -- a dropped key would shift nothing but
+            // would silently write a NULL over a real value on upsert.
+            let response = recorded("row_fetch");
+            let p = Profile::d1();
+            let columns = p.extract_columns(&response).expect("columns");
+            assert_eq!(columns.len(), 3, "got {columns:?}");
+
+            let rows = p.extract_rows(&response, &columns).expect("rows");
+            let name = columns.iter().position(|c| c == "name").expect("name");
+            assert_eq!(rows[0][name], Value::from("Alice"));
+            assert_eq!(rows[1][name], Value::Null, "a NULL must arrive as NULL");
+            assert_eq!(rows[1].len(), 3);
+        }
+
+        #[test]
+        fn a_later_row_missing_a_key_reads_null_not_a_shift() {
+            // Columns come from the FIRST row. If a later row omits a key --
+            // which D1 does not do today, but the reader must not corrupt if it
+            // did -- the value must be NULL in that column, never a left-shift
+            // that puts a body where a timestamp belongs.
+            let response = constructed(serde_json::json!([
+                {"id": "a", "body": "first", "note": "n"},
+                {"id": "b", "body": "second"}
+            ]));
+            let p = Profile::d1();
+            let columns = p.extract_columns(&response).expect("columns");
+            let rows = p.extract_rows(&response, &columns).expect("rows");
+            let body = columns.iter().position(|c| c == "body").expect("body");
+            let note = columns.iter().position(|c| c == "note").expect("note");
+            assert_eq!(rows[1][body], Value::from("second"));
+            assert_eq!(rows[1][note], Value::Null);
+        }
+
+        /// The three ways a `Path` profile can miss, all of which must reach the
+        /// rows rather than fail the read.
+        ///
+        /// Review of #451 caught two of these being dropped: the move into
+        /// `Profile` used `?` where the two adapter copies had fallen through,
+        /// so a Datasette response carrying `rows` but no `columns` went from a
+        /// successful read to "columns not found in response". These pin all
+        /// three so the fallback cannot vanish again in a diff billed as a move.
+        #[test]
+        fn a_path_profile_falls_back_to_the_rows_on_every_kind_of_miss() {
+            let p = Profile::datasette();
+
+            let absent = serde_json::json!({
+                "rows": [{"id": "a", "body": "first"}]
+            });
+            assert_eq!(
+                p.extract_columns(&absent).map(|mut c| {
+                    c.sort();
+                    c
+                }),
+                Some(vec!["body".to_string(), "id".to_string()]),
+                "a missing columns path must fall through to the rows"
+            );
+
+            let not_an_array = serde_json::json!({
+                "columns": {"unexpected": "shape"},
+                "rows": [{"id": "a", "body": "first"}]
+            });
+            assert_eq!(
+                p.extract_columns(&not_an_array).map(|mut c| {
+                    c.sort();
+                    c
+                }),
+                Some(vec!["body".to_string(), "id".to_string()]),
+                "a non-array columns path must fall through to the rows"
+            );
+
+            let no_names = serde_json::json!({
+                "columns": [1, 2],
+                "rows": [{"id": "a", "body": "first"}]
+            });
+            assert_eq!(
+                p.extract_columns(&no_names).map(|mut c| {
+                    c.sort();
+                    c
+                }),
+                Some(vec!["body".to_string(), "id".to_string()]),
+                "a columns path holding neither names nor descriptors falls through"
+            );
+        }
+
+        #[test]
+        fn a_path_profile_with_nothing_to_read_says_so() {
+            // The fallback must not become "always succeed": with no columns and
+            // no rows there is genuinely nothing, and the adapters turn None into
+            // a named error rather than an empty successful read.
+            let p = Profile::datasette();
+            assert_eq!(p.extract_columns(&serde_json::json!({})), None);
+            assert_eq!(p.extract_columns(&serde_json::json!({"rows": []})), None);
+        }
+
+        /// Datasette, recorded from a real instance (#436).
+        ///
+        /// The opposite shape to D1: rows are ARRAYS and a real `columns` list
+        /// is sent, which is why this profile declares `ColumnSource::Path` and
+        /// D1 declares `FirstRowKeys`. Recorded rather than reasoned about, so
+        /// the distinction rests on a response instead of a reading of the docs.
+        /// `tests/fixtures/datasette/README.md` has the commands.
+        #[test]
+        fn datasette_reads_its_own_recorded_responses() {
+            fn recorded_datasette(name: &str) -> Value {
+                let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/datasette/");
+                let text = std::fs::read_to_string(format!("{dir}{name}.json"))
+                    .unwrap_or_else(|e| panic!("recorded fixture {name}: {e}"));
+                serde_json::from_str(&text).expect("fixture is JSON")
+            }
+            let p = Profile::datasette();
+
+            let listing = recorded_datasette("sqlite_master_listing");
+            let columns = p.extract_columns(&listing).expect("columns");
+            assert_eq!(columns, vec!["name".to_string()]);
+            let rows = p.extract_rows(&listing, &columns).expect("rows");
+            assert_eq!(rows, vec![vec![Value::from("customers")]]);
+
+            let meta = recorded_datasette("metadata_select");
+            let columns = p.extract_columns(&meta).expect("columns");
+            assert_eq!(columns, vec!["__pk".to_string(), "updated_at".to_string()]);
+            let rows = p.extract_rows(&meta, &columns).expect("rows");
+            assert_eq!(rows[0][0], Value::from("a-uuid"));
+
+            // Array rows are taken as-is; a NULL stays a NULL rather than being
+            // dropped or shifted.
+            let fetch = recorded_datasette("row_fetch");
+            let columns = p.extract_columns(&fetch).expect("columns");
+            let rows = p.extract_rows(&fetch, &columns).expect("rows");
+            assert_eq!(rows[1][1], Value::Null);
+            assert_eq!(rows[1].len(), 3);
+        }
+
+        #[test]
+        fn a_descriptor_profile_still_reads_descriptors() {
+            // The confinement half of the fix: the "object with a `name` key is
+            // a descriptor" rule must keep working where a profile actually
+            // points at descriptors, or fixing D1 would break rqlite.
+            let response = serde_json::json!({
+                "results": [{
+                    "columns": ["id", "body"],
+                    "values": [["a", "first"], ["b", "second"]]
+                }]
+            });
+            let p = Profile::rqlite();
+            let columns = p.extract_columns(&response).expect("columns");
+            assert_eq!(columns, vec!["id".to_string(), "body".to_string()]);
+            let rows = p.extract_rows(&response, &columns).expect("rows");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Value::from("a"));
+        }
     }
 }

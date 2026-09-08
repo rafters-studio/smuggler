@@ -1,0 +1,1 @@
+{"ok": true, "database": "dsfix", "query_name": null, "rows": [["customers"]], "truncated": false, "columns": ["name"], "query": {"sql": "select name from sqlite_master where type='table' order by name", "params": {}}, "error": null, "private": false, "allow_execute_sql": true, "query_ms": 0.1959590008482337}

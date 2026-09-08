@@ -1,0 +1,1 @@
+{"ok": true, "database": "dsfix", "query_name": null, "rows": [["a-uuid", "Alice", 1700000000], ["b-uuid", null, 1700000001]], "truncated": false, "columns": ["id", "name", "updated_at"], "query": {"sql": "select * from customers", "params": {}}, "error": null, "private": false, "allow_execute_sql": true, "query_ms": 0.25762489531189203}
