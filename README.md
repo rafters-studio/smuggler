@@ -269,11 +269,10 @@ The ledger, `_smugglr_migrations`, assigns the version as `current + 1`, claims 
 The engine compiles to WebAssembly and ships as the `smugglr` package on npm, with `@smugglr/zustand` and `@smugglr/nanostores` on top of it. `Smugglr.init({source, dest, sync})`, then `.push()`, `.pull()`, `.sync()`, `.diff()`, all with `dryRun`; `on("table-changed")` after a pull writes rows; `updateAuth`, `updateDest`, `eraseLocal`, `dispose`. A local SQLite in the browser is a `SqlExecutor`, `createWaSqliteExecutor` for wa-sqlite on OPFS or IndexedDB, or your own for any runtime. `autoSync` hydrates on init, re-syncs on `online`, and serializes across tabs with a Web Lock; it is browser-only. From [`node-server-to-d1`](docs/examples/node-server-to-d1/), pushing Westwind through `better-sqlite3` to a local HTTP-SQL endpoint:
 
 ```
-loaded smugglr wasm: 316800 bytes
 push complete: {"command":"push","status":"ok","tables":[{"name":"categories","rowsPushed":8},{"name":"customers","rowsPushed":40},{"name":"employees","rowsPushed":9},{"name":"order_details","rowsPushed":788},{"name":"orders","rowsPushed":320},{"name":"products","rowsPushed":20},{"name":"shippers","rowsPushed":3},{"name":"suppliers","rowsPushed":8}]}
 ```
 
-In Node the wasm must be read from disk and handed to `setWasm` before `init()`, because the loader fetches a `file:` URL that Node's `fetch` refuses, and `setWasm` itself prints a wasm-bindgen deprecation warning while it does so (#437); the example shows the eight lines. The wasm is 316,800 bytes on disk and 126,497 gzipped in the published 0.5.0 package.
+That's a bare `Smugglr.init(config)`, no WASM setup of its own. The wasm is 316,800 bytes on disk and 126,497 gzipped in the published 0.5.0 package. Node's `fetch` has no `file:` scheme, so the wasm-bindgen loader's default fetch-relative-to-the-glue-module path cannot work there; `init()` detects the Node runtime and reads the bundled `.wasm` bytes with `node:fs` itself. `setWasm` stays for callers who want to control where the binary comes from (a CDN, a bundler-resolved import) and no longer trips wasm-bindgen's deprecation warning while doing it.
 
 ## Embedding the engine
 

@@ -129,7 +129,12 @@ jobs:
           version: 10
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # #437's Node test (test/node-init.test.mjs) calls node:sqlite's
+          # StatementSync.setReturnArrays(), added in Node 24.0.0 -- the same
+          # floor docs/examples/node-server-to-d1's local-endpoint.mjs
+          # already assumes. Keep this in step with packages/smugglr/README.md's
+          # Node paragraph.
+          node-version: 24
           cache: pnpm
           cache-dependency-path: packages/smugglr/pnpm-lock.yaml
       - name: Run smugglr-wasm unit tests (wasm32, node)
@@ -142,6 +147,9 @@ jobs:
       - name: Build smugglr
         working-directory: packages/smugglr
         run: pnpm build
+      - name: Run Node init test (#437)
+        working-directory: packages/smugglr
+        run: pnpm test:node
       - name: Install Playwright browsers
         working-directory: packages/smugglr
         run: pnpm test:e2e:install

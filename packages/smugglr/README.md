@@ -39,6 +39,37 @@ await s.sync();
 // freed at scope exit
 ```
 
+## Node
+
+`Smugglr.init()` works in Node with no extra setup. wasm-bindgen's default loader fetches the `.wasm` binary relative to its glue module, and Node's `fetch` has no `file:` scheme -- `init()` detects the Node runtime and reads the bundled binary itself, so a bare `await Smugglr.init(config)` just works. `setWasm` is still there for callers who want to control where the binary comes from (a CDN, a bundler-resolved import); see [Custom WASM loading](#custom-wasm-loading) below.
+
+```ts
+import { Smugglr } from "smugglr";
+import Database from "better-sqlite3"; // or node:sqlite
+
+const db = new Database("app.db");
+const executor = {
+  async run(sql, params) {
+    const stmt = db.prepare(sql);
+    if (stmt.reader) {
+      return { columns: stmt.columns().map((c) => c.name), rows: stmt.raw().all(params) };
+    }
+    stmt.run(params);
+    return { columns: [], rows: [] };
+  },
+};
+
+const s = await Smugglr.init({
+  source: { type: "local", executor },
+  dest: { url: "https://api.cloudflare.com/...", authToken: "cf", profile: "d1" },
+  sync: { tables: ["users", "posts"] },
+});
+
+await s.push();
+```
+
+Verified on Node 24.12.0 (`test/node-init.test.mjs`, run with `node --test`); 24.0.0 is the actual floor -- the test's local endpoint uses `node:sqlite`'s `StatementSync.setReturnArrays()`, added in that release. Full working scripts: [`node-server-to-d1`](../../docs/examples/node-server-to-d1/) (one push) and [`node-auto-sync`](../../docs/examples/node-auto-sync/) (a long-running sync loop with backoff).
+
 ## Local SQLite (browser, OPFS)
 
 Sync a real SQLite database in the browser (via [wa-sqlite](https://github.com/rhashimoto/wa-sqlite) on OPFS) to any HTTP SQL backend:
@@ -82,8 +113,7 @@ If your bundler resolves `.wasm` imports differently or you serve the binary fro
 import { Smugglr, setWasm } from "smugglr";
 import * as wasm from "smugglr/wasm";
 
-await wasm.default("https://cdn.example.com/smugglr_wasm_bg.wasm");
-setWasm(wasm);
+await setWasm(wasm, "https://cdn.example.com/smugglr_wasm_bg.wasm");
 
 const s = await Smugglr.init(config);
 ```
@@ -197,6 +227,13 @@ A Playwright suite under `e2e/` exercises the full local-OPFS path against a moc
 pnpm install
 pnpm test:e2e:install   # one-time: download chromium
 pnpm test:e2e
+```
+
+A plain `node --test` file under `test/` covers the Node path: `Smugglr.init()` with no `setWasm()` call, against a `node:sqlite` executor and a local generic-profile HTTP endpoint. Run with:
+
+```sh
+pnpm build   # test/node-init.test.mjs runs against dist/
+pnpm test:node
 ```
 
 ## License

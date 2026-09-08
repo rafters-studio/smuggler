@@ -30,7 +30,8 @@
     "build:ts": "tsc",
     "build": "pnpm build:wasm && pnpm build:ts && pnpm build:copy-wasm",
     "test:e2e": "playwright test",
-    "test:e2e:install": "playwright install --with-deps chromium"
+    "test:e2e:install": "playwright install --with-deps chromium",
+    "test:node": "node --test \"test/**/*.test.mjs\""
   },
   "keywords": [
     "sqlite",

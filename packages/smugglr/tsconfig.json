@@ -4,6 +4,7 @@
     "lib": ["ES2022", "ESNext.Disposable", "DOM"],
     "module": "ES2022",
     "moduleResolution": "bundler",
+    "types": ["node"],
     "declaration": true,
     "outDir": "dist",
     "rootDir": "src",
