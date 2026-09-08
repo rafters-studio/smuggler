@@ -301,7 +301,7 @@ after:  a=3, b=3
 
 Each of these is a reader's first ten minutes, stated here so it is met in the docs and not in production.
 
-**D1 does not work from the CLI.** Three independent defects: the CLI hands the plugin the wrong keys and no URL (#429), the 0.5.0 archive and `cargo install smugglr` ship no plugin at all (#430, fixed for 0.5.1), and the `d1` profile reads its rows as its column list, so table discovery collapses on the plugin and wasm paths alike (#436). The npm example builds the D1 URL itself and works against a generic endpoint; against real D1 it hits #436. Until all three land, do not point this at D1 and expect rows.
+**D1 does not work from the CLI.** Three independent defects, two now fixed: the CLI handed the plugin the wrong keys and no URL (#429, fixed for 0.5.1), the 0.5.0 archive and `cargo install smugglr` shipped no plugin at all (#430, fixed for 0.5.1), and the `d1` profile still reads its rows as its column list, so table discovery collapses on the plugin and wasm paths alike (#436). The request now leaves with the right URL and an `Authorization` header; what comes back is still misread. The npm example builds the D1 URL itself and works against a generic endpoint; against real D1 it hits #436. Until #436 lands, do not point this at D1 and expect rows.
 
 **`uuid_v7_wins` is `newer_wins`.** No code reads the key's timestamp; the variant orders on `timestamp_column` like `newer_wins` and prints a different warning (#431).
 

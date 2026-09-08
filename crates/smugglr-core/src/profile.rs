@@ -103,6 +103,20 @@ impl Profile {
         }
     }
 
+    /// The Cloudflare D1 query endpoint for an account and database (#429).
+    ///
+    /// Lives here rather than in config resolution because it is D1 platform
+    /// knowledge, the same as [`Profile::d1`]'s response paths and bind limit.
+    /// A caller with its own endpoint -- the Durable Objects bridge in
+    /// `templates/do-bridge/` is the documented case -- supplies a URL instead
+    /// and never calls this.
+    pub fn d1_query_url(account_id: &str, database_id: &str) -> String {
+        format!(
+            "https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{}/query",
+            account_id, database_id
+        )
+    }
+
     pub fn datasette() -> Self {
         Self {
             auth_format: AuthFormat::Bearer,

@@ -902,6 +902,20 @@ async fn gather_status<D: DataSource>(db: &D, config: &Config) -> StatusDb {
     }
 }
 
+/// The endpoint a resolved target will actually talk to, when there is one.
+///
+/// For a `d1` target the URL is derived from `account_id` and `database_id`
+/// (#429), so it appears in no file the operator wrote. `status` shows it, which
+/// is the only place a wrong account or database is visible before a push goes
+/// somewhere unintended. Returns only the URL -- the same plugin config carries
+/// the auth token, which stays out of every output.
+fn plugin_endpoint(target: &ResolvedTarget) -> Option<String> {
+    match target {
+        ResolvedTarget::Sqlite { .. } => None,
+        ResolvedTarget::Plugin { config, .. } => config.get("url").cloned(),
+    }
+}
+
 async fn run_status(
     config: &Config,
     target: ResolvedTarget,
@@ -911,6 +925,8 @@ async fn run_status(
         ResolvedTarget::Sqlite { .. } => "sqlite",
         ResolvedTarget::Plugin { ref name, .. } => name.as_str(),
     };
+
+    let target_url = plugin_endpoint(&target);
 
     // Gather local DB info
     let local_status = match LocalDb::open_readonly(config.local_db_path()) {
@@ -940,6 +956,7 @@ async fn run_status(
                 config: StatusConfig {
                     local_db: config.local_db_path().to_string(),
                     target_type: target_type.to_string(),
+                    target_url: target_url.clone(),
                     timestamp_column: config.sync.timestamp_column.clone(),
                     conflict_resolution: format!("{:?}", config.sync.conflict_resolution),
                     tables: config.sync.tables.clone(),
@@ -967,6 +984,9 @@ async fn run_status(
                 } => {
                     println!("  Target: Plugin ({})", name);
                     println!("  Plugin path: {}", path.display());
+                    if let Some(url) = &target_url {
+                        println!("  Endpoint: {}", url);
+                    }
                 }
             }
 
@@ -1400,5 +1420,66 @@ mod tests {
         assert!(status.connected);
         assert!(status.error.is_none());
         assert_eq!(status.tables.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod status_shows_the_endpoint {
+    use super::*;
+    use smugglr_core::config::d1_plugin_config;
+    use std::path::PathBuf;
+
+    fn plugin_target(config: std::collections::HashMap<String, String>) -> ResolvedTarget {
+        ResolvedTarget::Plugin {
+            path: PathBuf::from("/fake/smugglr-http-sql"),
+            name: "smugglr-http-sql".to_string(),
+            config,
+        }
+    }
+
+    #[test]
+    fn a_d1_target_shows_the_endpoint_it_derived() {
+        // #429: the D1 URL is built from account_id and database_id and written
+        // in no config file, so status is the only place an operator can see
+        // that a push is aimed at the account they meant.
+        let target = plugin_target(d1_plugin_config("acct", "db", "tok", None));
+        assert_eq!(
+            plugin_endpoint(&target).as_deref(),
+            Some("https://api.cloudflare.com/client/v4/accounts/acct/d1/database/db/query")
+        );
+    }
+
+    #[test]
+    fn a_configured_endpoint_is_shown_as_configured() {
+        let target = plugin_target(d1_plugin_config(
+            "acct",
+            "db",
+            "tok",
+            Some("https://do-bridge.example.workers.dev/query"),
+        ));
+        assert_eq!(
+            plugin_endpoint(&target).as_deref(),
+            Some("https://do-bridge.example.workers.dev/query")
+        );
+    }
+
+    #[test]
+    fn the_token_never_reaches_the_endpoint_line() {
+        // The plugin config status reads from also carries the bearer token.
+        // Only the url is surfaced, and this pins that.
+        let target = plugin_target(d1_plugin_config("acct", "db", "s3cr3t", None));
+        let shown = plugin_endpoint(&target).expect("a d1 target has an endpoint");
+        assert!(
+            !shown.contains("s3cr3t"),
+            "status must not print the token: {shown}"
+        );
+    }
+
+    #[test]
+    fn a_sqlite_target_has_no_endpoint() {
+        let target = ResolvedTarget::Sqlite {
+            database: "backup.db".into(),
+        };
+        assert_eq!(plugin_endpoint(&target), None);
     }
 }

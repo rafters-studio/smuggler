@@ -26,3 +26,9 @@ serde_json = "1"
 sha2 = "0.10"
 hex = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+# The #429 tests drive the documented `[target] type = "d1"` config through
+# smugglr-core's own resolve_target, so they parse the same TOML an operator
+# writes rather than constructing Config by hand.
+toml = "0.8"

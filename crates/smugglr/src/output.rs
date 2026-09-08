@@ -104,6 +104,14 @@ pub struct StatusOutput {
 pub struct StatusConfig {
     pub local_db: String,
     pub target_type: String,
+    /// The endpoint a plugin target will actually talk to (#429).
+    ///
+    /// For a `d1` target this is derived rather than configured, so an operator
+    /// who cannot see it cannot tell a working config from one pointed at the
+    /// wrong account. Only the URL: the token in the same plugin config stays
+    /// out of the output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_url: Option<String>,
     pub timestamp_column: String,
     pub conflict_resolution: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -463,6 +471,7 @@ mod tests {
             config: StatusConfig {
                 local_db: "game.db".into(),
                 target_type: "sqlite".into(),
+                target_url: None,
                 timestamp_column: "updated_at".into(),
                 conflict_resolution: "NewerWins".into(),
                 tables: vec![],
@@ -728,6 +737,7 @@ mod tests {
             config: StatusConfig {
                 local_db: "game.db".into(),
                 target_type: "sqlite".into(),
+                target_url: None,
                 timestamp_column: "updated_at".into(),
                 conflict_resolution: "NewerWins".into(),
                 tables: vec!["abilities".into(), "items".into()],

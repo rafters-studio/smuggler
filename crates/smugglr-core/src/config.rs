@@ -39,8 +39,9 @@ pub enum TargetConfig {
         account_id: String,
         database_id: String,
         api_token: String,
-        /// Custom endpoint URL (overrides the default Cloudflare D1 API).
-        /// Use this to point at a DO bridge or other D1-compatible endpoint.
+        /// Custom endpoint URL. Omit it and the target resolves to Cloudflare's
+        /// own D1 query endpoint for `account_id` and `database_id`; set it to
+        /// point at a DO bridge or other D1-compatible endpoint instead.
         url: Option<String>,
     },
     /// Local SQLite target
@@ -897,15 +898,7 @@ fn resolve_d1_plugin_target(
     api_token: &str,
     url: Option<&str>,
 ) -> Result<ResolvedTarget> {
-    let mut plugin_config = HashMap::new();
-    plugin_config.insert("profile".to_string(), "d1".to_string());
-    plugin_config.insert("account_id".to_string(), account_id.to_string());
-    plugin_config.insert("database_id".to_string(), database_id.to_string());
-    plugin_config.insert("api_token".to_string(), api_token.to_string());
-    if let Some(u) = url {
-        plugin_config.insert("url".to_string(), u.to_string());
-    }
-
+    let plugin_config = d1_plugin_config(account_id, database_id, api_token, url);
     let plugin_path = resolve_http_sql_plugin_path()?;
 
     Ok(ResolvedTarget::Plugin {
@@ -913,6 +906,43 @@ fn resolve_d1_plugin_target(
         name: "smugglr-http-sql".to_string(),
         config: plugin_config,
     })
+}
+
+/// The plugin config a `d1` target hands the http-sql adapter.
+///
+/// Split out of [`resolve_d1_plugin_target`] and public because it is the seam
+/// #429 was a defect in: core synthesized keys the adapter did not read. The
+/// adapter's own tests drive this function and then assert what reaches the
+/// wire, which they cannot do through `resolve_target` -- that also resolves
+/// the plugin BINARY, which needs the `native` feature and an installed file,
+/// neither of which a wire-format test should require. Keeping the synthesis
+/// pure means both sides of the seam are asserted against the same code.
+pub fn d1_plugin_config(
+    account_id: &str,
+    database_id: &str,
+    api_token: &str,
+    url: Option<&str>,
+) -> HashMap<String, String> {
+    let mut plugin_config = HashMap::new();
+    plugin_config.insert("profile".to_string(), "d1".to_string());
+    plugin_config.insert("account_id".to_string(), account_id.to_string());
+    plugin_config.insert("database_id".to_string(), database_id.to_string());
+
+    // The adapter reads `auth_token`, never `api_token` (#429). `api_token`
+    // stays the name of the TOML field an operator writes; only the key handed
+    // across the plugin boundary changes here.
+    plugin_config.insert("auth_token".to_string(), api_token.to_string());
+
+    // A caller-supplied URL wins -- that is the DO-bridge case documented in
+    // `config.example.toml`. With none, derive Cloudflare's own endpoint, which
+    // is what the README's quickstart has always claimed happens (#429).
+    let resolved_url = match url {
+        Some(u) => u.to_string(),
+        None => crate::profile::Profile::d1_query_url(account_id, database_id),
+    };
+    plugin_config.insert("url".to_string(), resolved_url);
+
+    plugin_config
 }
 
 /// Resolve the path to the smugglr-http-sql plugin binary.
@@ -1057,12 +1087,18 @@ mod tests {
     /// Assert that `target` is a `ResolvedTarget::Plugin` pointing at the
     /// http-sql plugin with a synthesized d1 profile config. Used by every
     /// test that exercises the D1-to-plugin routing in `resolve_target`.
+    ///
+    /// `expected_url` is written out in full at each call site rather than
+    /// derived here (#429). A helper that built the Cloudflare URL the same way
+    /// `resolve_d1_plugin_target` does would agree with any derivation,
+    /// including a wrong one, which is the whole thing this test exists to
+    /// catch.
     fn assert_d1_plugin(
         target: &ResolvedTarget,
         account_id: &str,
         database_id: &str,
-        api_token: &str,
-        url: Option<&str>,
+        auth_token: &str,
+        expected_url: &str,
     ) {
         let ResolvedTarget::Plugin { name, config, .. } = target else {
             panic!("expected plugin target, got {:?}", target);
@@ -1077,8 +1113,17 @@ mod tests {
             config.get("database_id").map(String::as_str),
             Some(database_id)
         );
-        assert_eq!(config.get("api_token").map(String::as_str), Some(api_token));
-        assert_eq!(config.get("url").map(String::as_str), url);
+
+        // The adapter reads `auth_token`. `api_token` was the key core used to
+        // send and nothing ever read (#429); assert it is gone, so a revert
+        // cannot pass by adding the old key back alongside the new one.
+        assert_eq!(
+            config.get("auth_token").map(String::as_str),
+            Some(auth_token)
+        );
+        assert_eq!(config.get("api_token"), None);
+
+        assert_eq!(config.get("url").map(String::as_str), Some(expected_url));
     }
 
     #[test]
@@ -1106,7 +1151,13 @@ mod tests {
     fn test_resolve_target_legacy_d1() {
         let config = test_config_d1();
         let target = config.resolve_target().unwrap();
-        assert_d1_plugin(&target, "test_acct", "test_db", "test_token", None);
+        assert_d1_plugin(
+            &target,
+            "test_acct",
+            "test_db",
+            "test_token",
+            "https://api.cloudflare.com/client/v4/accounts/test_acct/d1/database/test_db/query",
+        );
     }
 
     #[test]
@@ -1137,7 +1188,13 @@ mod tests {
             broadcast: None,
         };
         let target = config.resolve_target().unwrap();
-        assert_d1_plugin(&target, "acct", "db", "tok", None);
+        assert_d1_plugin(
+            &target,
+            "acct",
+            "db",
+            "tok",
+            "https://api.cloudflare.com/client/v4/accounts/acct/d1/database/db/query",
+        );
     }
 
     #[test]
@@ -1162,13 +1219,7 @@ mod tests {
             broadcast: None,
         };
         let target = config.resolve_target().unwrap();
-        assert_d1_plugin(
-            &target,
-            "acct",
-            "db",
-            "tok",
-            Some("https://bridge.example.com"),
-        );
+        assert_d1_plugin(&target, "acct", "db", "tok", "https://bridge.example.com");
     }
 
     #[test]
@@ -1358,7 +1409,13 @@ api_token = "tok789"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         let target = config.resolve_target().unwrap();
-        assert_d1_plugin(&target, "acct123", "db456", "tok789", None);
+        assert_d1_plugin(
+            &target,
+            "acct123",
+            "db456",
+            "tok789",
+            "https://api.cloudflare.com/client/v4/accounts/acct123/d1/database/db456/query",
+        );
     }
 
     #[test]
@@ -1372,7 +1429,13 @@ local_db = "game.db"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.target.is_none());
         let target = config.resolve_target().unwrap();
-        assert_d1_plugin(&target, "acct", "db", "tok", None);
+        assert_d1_plugin(
+            &target,
+            "acct",
+            "db",
+            "tok",
+            "https://api.cloudflare.com/client/v4/accounts/acct/d1/database/db/query",
+        );
     }
 
     // -- Column exclusion tests --

@@ -84,7 +84,7 @@ push complete: {"command":"push","status":"ok","tables":[{"name":"categories"},{
 
 ## Pushing to D1
 
-Uncomment the three D1 lines in `.env` and fill in the account id, database id, and token; the script is unchanged. The URL is the D1 query endpoint, `https://api.cloudflare.com/client/v4/accounts/<account-id>/d1/database/<database-id>/query`, and `DEST_PROFILE=d1` selects D1's request and response shape. D1 needs the same eight tables first. The CLI's own D1 path cannot apply the Westwind manifests there in 0.5.0 (#429), so export the schema from the local file and load it with wrangler: `sqlite3 app.sqlite .schema > schema.sql`, then `pnpm dlx wrangler d1 execute <name> --remote --file=schema.sql`. This path was not run here; it needs a D1 token.
+Uncomment the three D1 lines in `.env` and fill in the account id, database id, and token; the script is unchanged. The URL is the D1 query endpoint, `https://api.cloudflare.com/client/v4/accounts/<account-id>/d1/database/<database-id>/query`, and `DEST_PROFILE=d1` selects D1's request and response shape. D1 needs the same eight tables first. The CLI cannot apply the Westwind manifests to a remote target at all -- `migrate apply` takes a local database file, and remote apply is unbuilt (#291) -- so export the schema from the local file and load it with wrangler: `sqlite3 app.sqlite .schema > schema.sql`, then `pnpm dlx wrangler d1 execute <name> --remote --file=schema.sql`. This path was not run here; it needs a D1 token.
 
 ## What this demonstrates
 

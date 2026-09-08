@@ -765,3 +765,235 @@ mod tests {
         }
     }
 }
+
+/// The request an [`HttpSqlAdapter`] actually put on the wire, as read off a
+/// socket rather than as the adapter reports it (#429).
+#[cfg(test)]
+struct CapturedRequest {
+    path: String,
+    authorization: Option<String>,
+}
+
+/// Stand up a one-shot HTTP endpoint, answer a single request with `body`, and
+/// hand back what arrived.
+///
+/// Hand-rolled on a `TcpListener` because the point is to read the bytes the
+/// adapter sent. A mock built on reqwest's own types would agree with reqwest
+/// about what was sent, which is the thing under test.
+#[cfg(test)]
+async fn capture_one_request(
+    body: &'static str,
+) -> (String, tokio::task::JoinHandle<CapturedRequest>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("read back the bound port");
+
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept the adapter");
+
+        // Read until the header block ends. The adapter sends a small JSON body
+        // with Content-Length, so one read is not guaranteed to cover it; loop
+        // until the blank line so the request line and headers are complete.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = socket.read(&mut chunk).await.expect("read the request");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&buf).to_string();
+
+        let path = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string();
+        let authorization = text
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+            .map(|l| l["authorization:".len()..].trim().to_string());
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("answer the adapter");
+        socket.flush().await.expect("flush the response");
+
+        CapturedRequest {
+            path,
+            authorization,
+        }
+    });
+
+    (format!("http://{}", addr), handle)
+}
+
+#[cfg(test)]
+mod d1_target_reaches_d1 {
+    use super::*;
+    use smugglr_core::config::{d1_plugin_config, Config, TargetConfig};
+
+    /// A D1-shaped answer to `initialize`'s own `SELECT 1`.
+    ///
+    /// `initialize` ends by executing that statement, so a capture endpoint that
+    /// answers with something the profile cannot parse fails the connection test
+    /// before any assertion runs. These tests assert on the REQUEST -- URL and
+    /// Authorization -- so the response only has to be parseable. Whether the d1
+    /// profile reads such a response CORRECTLY is #436, and is deliberately not
+    /// asserted here.
+    const D1_SELECT_1: &str = r#"{"result":[{"results":[{"1":1}],"success":true}],"success":true}"#;
+
+    /// The plugin config for the documented `[target] type = "d1"` TOML.
+    ///
+    /// Parses the TOML an operator actually writes, so the field names are
+    /// exercised, then hands the fields to core's own synthesis rather than
+    /// restating what it produces.
+    fn documented_d1_plugin_config(url: Option<&str>) -> HashMap<String, String> {
+        let mut toml_text = String::from(
+            "local_db = \"app.db\"\n[target]\ntype = \"d1\"\naccount_id = \"acct\"\ndatabase_id = \"db\"\napi_token = \"tok\"\n",
+        );
+        if let Some(u) = url {
+            toml_text.push_str(&format!("url = \"{}\"\n", u));
+        }
+        let config: Config =
+            toml::from_str(&toml_text).expect("the documented d1 config must parse");
+
+        let Some(TargetConfig::D1 {
+            account_id,
+            database_id,
+            api_token,
+            url,
+        }) = config.target
+        else {
+            panic!("type = \"d1\" must parse as TargetConfig::D1");
+        };
+        d1_plugin_config(&account_id, &database_id, &api_token, url.as_deref())
+    }
+
+    /// Point a real adapter at a capture endpoint using the config core built,
+    /// preserving the resolved path so the assertion covers what core produced.
+    async fn initialize_against(plugin_config: &HashMap<String, String>, endpoint: &str) {
+        let resolved_url = plugin_config
+            .get("url")
+            .expect("core must hand the adapter a url")
+            .clone();
+        let path = match resolved_url.split_once("://") {
+            Some((_, rest)) => match rest.split_once('/') {
+                Some((_, p)) => format!("/{}", p),
+                None => String::new(),
+            },
+            None => String::new(),
+        };
+
+        let mut on_the_wire = plugin_config.clone();
+        on_the_wire.insert("url".to_string(), format!("{}{}", endpoint, path));
+
+        let mut adapter = HttpSqlAdapter::new();
+        adapter
+            .initialize(on_the_wire)
+            .await
+            .expect("initialize must reach the endpoint and parse SELECT 1");
+    }
+
+    #[tokio::test]
+    async fn the_documented_d1_config_reaches_cloudflare_with_its_token() {
+        // #429: `[target] type = "d1"` with account_id/database_id/api_token --
+        // the shape the README, config.example.toml and the get-started page all
+        // teach. Before the fix this failed at `missing config: url`, and with a
+        // url supplied by hand the request arrived as `Authorization: None`.
+        let (endpoint, server) = capture_one_request(D1_SELECT_1).await;
+        let plugin_config = documented_d1_plugin_config(None);
+
+        assert_eq!(
+            plugin_config.get("url").map(String::as_str),
+            Some("https://api.cloudflare.com/client/v4/accounts/acct/d1/database/db/query"),
+            "core must derive Cloudflare's own D1 endpoint when no url is configured"
+        );
+        assert_eq!(
+            plugin_config.get("api_token"),
+            None,
+            "#429: the key nothing read is gone"
+        );
+
+        initialize_against(&plugin_config, &endpoint).await;
+
+        let captured = server.await.expect("the capture task must finish");
+        assert_eq!(
+            captured.path, "/client/v4/accounts/acct/d1/database/db/query",
+            "the adapter must POST to the path core resolved"
+        );
+        assert_eq!(
+            captured.authorization.as_deref(),
+            Some("Bearer tok"),
+            "the api_token must arrive as a bearer token"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_url_still_wins_and_carries_the_token() {
+        // The DO-bridge case in config.example.toml: type = "d1" with an
+        // explicit url. It was broken the same way -- the token never reached
+        // the adapter -- and the fix must not take the custom url away.
+        let (endpoint, server) = capture_one_request(D1_SELECT_1).await;
+        let plugin_config =
+            documented_d1_plugin_config(Some("https://do-bridge.example.workers.dev/query"));
+
+        assert_eq!(
+            plugin_config.get("url").map(String::as_str),
+            Some("https://do-bridge.example.workers.dev/query"),
+            "a configured url must survive resolution untouched"
+        );
+
+        initialize_against(&plugin_config, &endpoint).await;
+
+        let captured = server.await.expect("the capture task must finish");
+        assert_eq!(captured.path, "/query");
+        assert_eq!(captured.authorization.as_deref(), Some("Bearer tok"));
+    }
+
+    #[tokio::test]
+    async fn the_legacy_flat_keys_reach_d1_too() {
+        // cloudflare_account_id / database_id / cloudflare_api_token funnel
+        // through the same synthesis and failed identically. Parsed from TOML so
+        // the legacy field names are exercised, not just the values.
+        let (endpoint, server) = capture_one_request(D1_SELECT_1).await;
+        let config: Config = toml::from_str(
+            "local_db = \"app.db\"\ncloudflare_account_id = \"acct\"\ndatabase_id = \"db\"\ncloudflare_api_token = \"tok\"\n",
+        )
+        .expect("the legacy flat config must parse");
+
+        let plugin_config = d1_plugin_config(
+            config.cloudflare_account_id.as_deref().expect("account id"),
+            config.database_id.as_deref().expect("database id"),
+            config.cloudflare_api_token.as_deref().expect("api token"),
+            None,
+        );
+        assert_eq!(
+            plugin_config.get("url").map(String::as_str),
+            Some("https://api.cloudflare.com/client/v4/accounts/acct/d1/database/db/query")
+        );
+
+        initialize_against(&plugin_config, &endpoint).await;
+
+        let captured = server.await.expect("the capture task must finish");
+        assert_eq!(
+            captured.path,
+            "/client/v4/accounts/acct/d1/database/db/query"
+        );
+        assert_eq!(captured.authorization.as_deref(), Some("Bearer tok"));
+    }
+}
