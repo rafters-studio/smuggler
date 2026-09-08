@@ -455,19 +455,20 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
     // target, a non-SQLite `DataSource`) returns no parents by default, which
     // leaves the order at its alphabetical tiebreak, unchanged from before
     // this method existed.
+    //
+    // A `LocalDb` failure here is propagated, not warned-and-skipped: `table`
+    // came from `list_tables()` and already passed `table_info()` above, so
+    // it exists, and `PRAGMA foreign_key_list` on a table that exists should
+    // not fail in ordinary operation. Silently treating a read failure as
+    // "no parents" would quietly hand back exactly the unordered, FK-unsafe
+    // write order this function exists to replace, with only a log line as
+    // evidence -- worse than surfacing it now, since the alternative is the
+    // operator discovering it later as a write-time FOREIGN KEY constraint
+    // failure with no obvious connection to its real cause.
     let mut parents_of: HashMap<String, Vec<String>> = HashMap::new();
     for table in &syncable {
-        match local.foreign_key_parents(table).await {
-            Ok(parents) => {
-                parents_of.insert(table.clone(), parents);
-            }
-            Err(e) => {
-                warn!(
-                    "Could not read foreign keys for table '{}': {}; treating it as having none",
-                    table, e
-                );
-            }
-        }
+        let parents = local.foreign_key_parents(table).await?;
+        parents_of.insert(table.clone(), parents);
     }
     let (ordered, cyclic) = topological_table_order(&syncable, &parents_of);
     if !cyclic.is_empty() {
@@ -500,32 +501,51 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
 /// `tables`, and the caller is expected to log one warning naming those
 /// tables (this function has no logging dependency, so it stays a pure,
 /// directly testable sort).
+///
+/// `tables` may contain duplicate names without corrupting the result: a
+/// repeated name is deduplicated up front and appears once in the returned
+/// order. (`get_tables_to_sync`'s `syncable`, the only caller today, is
+/// already duplicate-free -- it comes from a `HashSet` intersection -- but
+/// this function is pure and separately tested, so a future caller does not
+/// inherit that as an undocumented precondition: without the dedup, a
+/// repeated name would collapse to one `indegree` entry while `tables.len()`
+/// still counted both copies, so the order-complete check below would never
+/// see `order.len() == tables.len()` and every call would report a false
+/// cycle naming the duplicate.)
 fn topological_table_order(
     tables: &[String],
     parents_of: &HashMap<String, Vec<String>>,
 ) -> (Vec<String>, Vec<String>) {
-    let table_set: HashSet<&str> = tables.iter().map(String::as_str).collect();
+    let mut tables_seen: HashSet<&str> = HashSet::with_capacity(tables.len());
+    let tables: Vec<&str> = tables
+        .iter()
+        .map(String::as_str)
+        .filter(|t| tables_seen.insert(*t))
+        .collect();
+    let tables = tables.as_slice();
+
+    let table_set: HashSet<&str> = tables.iter().copied().collect();
 
     // in-degree = number of (in-set, non-self) parents a table still has left
     // to place; `dependents` is the reverse edge, parent -> its children.
-    let mut indegree: HashMap<&str, usize> = tables.iter().map(|t| (t.as_str(), 0)).collect();
+    let mut indegree: HashMap<&str, usize> = tables.iter().map(|&t| (t, 0)).collect();
     let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
 
-    for table in tables {
+    for &table in tables {
         let Some(parents) = parents_of.get(table) else {
             continue;
         };
         let mut seen: HashSet<&str> = HashSet::new();
         for parent in parents {
             let parent = parent.as_str();
-            if parent == table.as_str() || !table_set.contains(parent) || !seen.insert(parent) {
+            if parent == table || !table_set.contains(parent) || !seen.insert(parent) {
                 // Self-reference (out of scope), a parent outside this sync
                 // run, or a duplicate edge from a multi-column foreign key to
                 // the same parent -- none of these add a new ordering constraint.
                 continue;
             }
-            *indegree.entry(table.as_str()).or_insert(0) += 1;
-            dependents.entry(parent).or_default().push(table.as_str());
+            *indegree.entry(table).or_insert(0) += 1;
+            dependents.entry(parent).or_default().push(table);
         }
     }
 
@@ -564,12 +584,12 @@ fn topological_table_order(
     let placed: HashSet<&str> = order.into_iter().collect();
     let mut cyclic: Vec<String> = tables
         .iter()
-        .filter(|t| !placed.contains(t.as_str()))
-        .cloned()
+        .filter(|&&t| !placed.contains(t))
+        .map(|t| t.to_string())
         .collect();
     cyclic.sort();
 
-    let mut fallback = tables.to_vec();
+    let mut fallback: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
     fallback.sort();
     (fallback, cyclic)
 }
@@ -908,6 +928,25 @@ mod tests {
             let (order, cyclic) = topological_table_order(&tables, &fks);
             assert_eq!(order, s(&["orders", "line_items"]));
             assert!(cyclic.is_empty());
+        }
+
+        #[test]
+        fn a_duplicate_table_name_in_the_input_does_not_manufacture_a_false_cycle() {
+            // Review finding (#448): `indegree` collapses a repeated name to
+            // one entry while the old `tables.len()` still counted both
+            // copies, so `order.len() == tables.len()` could never hold and
+            // every call would misreport a cycle naming the duplicate. The
+            // function now deduplicates its input up front instead of relying
+            // on every caller to pass an already-unique list.
+            let tables = s(&["orders", "orders", "customers"]);
+            let fks = parents(&[("orders", &["customers"])]);
+            let (order, cyclic) = topological_table_order(&tables, &fks);
+            assert_eq!(
+                order,
+                s(&["customers", "orders"]),
+                "the duplicate collapses"
+            );
+            assert!(cyclic.is_empty(), "not a cycle: {cyclic:?}");
         }
     }
 
