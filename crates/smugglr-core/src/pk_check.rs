@@ -309,6 +309,14 @@ pub fn classify_table_ddl(table: &str, ddl: &str) -> Vec<PkFinding> {
 /// all) -- and re-declaring DESC on either would be a direction change this
 /// issue never asked for, in a case #413 has no test either side of. Reading
 /// `pk_desc` straight off the parsed column leaves both exactly as declared.
+///
+/// Gated to match its only caller, `migrate::apply::rebuild_dropping_column`,
+/// which is `native`-only. Without the gate this is dead code under `wasm32`
+/// and `cargo clippy -p smugglr-wasm --target wasm32-unknown-unknown` fails on
+/// `-D warnings` -- which the host clippy run cannot see, because
+/// `smugglr-wasm` is `#![cfg(target_arch = "wasm32")]` and compiles to nothing
+/// on the host. That is the shape of #422 and of #155 before it.
+#[cfg(feature = "native")]
 pub(crate) fn column_level_pk_is_desc(ddl: &str, column: &str) -> Option<bool> {
     let parsed = ParsedTable::parse(ddl)?;
     Some(
