@@ -57,6 +57,23 @@ fn snapshot_suffix() -> String {
     hex::encode(bytes)
 }
 
+/// Build the `VACUUM INTO` destination path for a snapshot: alongside the
+/// source database, named with the current pid and a random suffix so
+/// concurrent snapshots (even from the same process) never collide.
+///
+/// `VACUUM INTO` refuses to write to a path that already exists, so unlike
+/// `tempfile::NamedTempFile` (which pre-creates the file) this only computes
+/// a path -- the file is created by SQLite itself.
+fn snapshot_temp_path(local_db_path: &str) -> std::path::PathBuf {
+    let local_path = Path::new(local_db_path);
+    let parent = local_path.parent().unwrap_or(Path::new("."));
+    parent.join(format!(
+        ".smugglr-snapshot-{}-{}.tmp",
+        std::process::id(),
+        snapshot_suffix()
+    ))
+}
+
 /// Render a snapshot timestamp as a filename-safe object-key component.
 ///
 /// Snapshot object keys are used verbatim as filenames by the LocalFileSystem
@@ -101,8 +118,39 @@ pub async fn snapshot(
         });
     }
 
-    let db_bytes = std::fs::read(local_db_path)
-        .map_err(|e| SyncError::Stash(format!("Failed to read local database: {}", e)))?;
+    // Materialize the snapshot bytes via `VACUUM INTO`, on the SAME connection
+    // that just counted the rows above. A raw `std::fs::read` of the database
+    // file (the old approach) only sees the base file -- on a WAL-mode
+    // database, committed rows still sitting in `<db>-wal` are silently
+    // missing from the uploaded bytes even though `row_count` above (which
+    // reads through the connection, and therefore already merges the WAL)
+    // counted them. `VACUUM INTO` also reads through the connection, so it
+    // captures exactly what `row_count` counted, WAL or not -- and unlike a
+    // concurrent raw file read, it can never observe a torn/in-progress page
+    // set. See #433.
+    //
+    // The temp file is removed on every exit from this block, success or
+    // error: the `VACUUM INTO` failure path and the read failure path both
+    // clean it up before propagating, and the success path removes it right
+    // after the bytes are loaded into memory.
+    let temp_path = snapshot_temp_path(local_db_path);
+    {
+        let conn = local.conn();
+        conn.execute(
+            "VACUUM INTO ?1",
+            rusqlite::params![temp_path.to_string_lossy().as_ref()],
+        )
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            SyncError::Stash(format!("Failed to vacuum snapshot to temp file: {}", e))
+        })?;
+    }
+
+    let db_bytes = std::fs::read(&temp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        SyncError::Stash(format!("Failed to read snapshot temp file: {}", e))
+    })?;
+    let _ = std::fs::remove_file(&temp_path);
     let size_bytes = db_bytes.len() as u64;
 
     if dry_run {
@@ -391,6 +439,52 @@ mod tests {
         }
     }
 
+    /// List any `.smugglr-snapshot-*.tmp` files left behind in `dir` --
+    /// `snapshot_temp_path`'s `VACUUM INTO` destinations. Used to assert the
+    /// temp file is actually removed, on both the success and error paths
+    /// (#433), rather than trusting the source comment.
+    fn leftover_snapshot_temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with(".smugglr-snapshot-") && name.ends_with(".tmp"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Create a WAL-mode test database with `row_count` rows in `items`, and
+    /// return the still-open connection. Both #433 WAL regression tests need
+    /// the writer kept open through the `snapshot()` call so SQLite's
+    /// close-time auto-checkpoint cannot quietly merge the WAL and hide the
+    /// bug being tested -- returning the live connection (instead of
+    /// dropping it here) is what makes that possible.
+    fn create_wal_test_db(path: &Path, row_count: i64) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal", "journal_mode must be WAL");
+        conn.execute_batch(
+            "CREATE TABLE items (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                updated_at TEXT
+            )",
+        )
+        .unwrap();
+        for i in 1..=row_count {
+            conn.execute(
+                "INSERT INTO items (id, name, updated_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![i, format!("item-{}", i), "2024-01-01"],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
     #[tokio::test]
     async fn test_snapshot_creates_files() {
         let dir = TempDir::new().unwrap();
@@ -527,6 +621,231 @@ mod tests {
         assert_eq!(id, 9);
     }
 
+    // Regression for #433: a WAL-mode database's committed rows can sit in
+    // `<db>-wal` until checkpointed. The old snapshot path read the base file
+    // directly with `std::fs::read`, which never sees those rows even though
+    // the counting connection (which merges the WAL like any other reader)
+    // already counted them. `conn` (the writer) is kept open through the
+    // `snapshot()` call so SQLite's close-time auto-checkpoint cannot quietly
+    // merge the WAL into the base file and hide the bug being tested.
+    #[tokio::test]
+    async fn test_snapshot_captures_wal_committed_rows() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let snap_dir = dir.path().join("snap_store");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        let conn = create_wal_test_db(&local_path, 25);
+
+        // Confirm the WAL sidecar actually holds uncheckpointed bytes --
+        // otherwise this test would not be exercising the bug at all.
+        let wal_path = dir.path().join("local.sqlite-wal");
+        let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_len > 0,
+            "expected uncheckpointed WAL content, got {} bytes",
+            wal_len
+        );
+
+        let pre_snapshot_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pre_snapshot_count, 25);
+
+        let config = make_file_stash_config(&snap_dir);
+
+        // `conn` (the writer) stays open through this call.
+        let snap_result = snapshot(&config, local_path.to_str().unwrap(), false)
+            .await
+            .unwrap();
+
+        let metadata_count = snap_result
+            .tables
+            .iter()
+            .find(|t| t.name == "items")
+            .map(|t| t.row_count)
+            .unwrap();
+        assert_eq!(
+            metadata_count, 25,
+            "metadata row_count should see WAL-resident rows"
+        );
+
+        // The `VACUUM INTO` temp file must not survive a successful snapshot.
+        assert!(
+            leftover_snapshot_temp_files(dir.path()).is_empty(),
+            "snapshot temp file leaked on the success path"
+        );
+
+        drop(conn);
+
+        let restore_path = dir.path().join("restored.sqlite");
+        let restore_result = restore(
+            &config,
+            restore_path.to_str().unwrap(),
+            &snap_result.timestamp,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restore_result.timestamp, snap_result.timestamp);
+
+        let restored_conn =
+            Connection::open_with_flags(&restore_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        // `unwrap_or(0)` rather than `unwrap()`: on the pre-fix code the whole
+        // `items` table can be missing from the restored file (nothing had
+        // been checkpointed to the base file yet, so a raw `std::fs::read`
+        // copies an effectively schema-less database), which fails the query
+        // itself rather than just undercounting. Folding that into 0 keeps
+        // the assertion below reporting an actual observed count instead of
+        // panicking inside the query.
+        let restored_count: i64 = restored_conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        assert_eq!(
+            restored_count as usize, metadata_count,
+            "restored row count must equal the snapshot metadata's row_count"
+        );
+        assert_eq!(
+            restored_count, pre_snapshot_count,
+            "restored row count must equal the pre-snapshot row count"
+        );
+    }
+
+    // Regression for #433 (restore side): the production recovery flow does
+    // NOT restore into a fresh path -- `smugglr restore` always targets
+    // `config.local_db_path()`, the same live path the snapshot was taken
+    // from. This confirms the fix holds under that exact shape: every
+    // WAL-resident row comes back when restoring in place over a corrupted
+    // live database.
+    //
+    // It also pins down and documents a real, deliberate side effect: the
+    // `VACUUM INTO` output is always a rollback-journal database (verified
+    // directly against SQLite -- `VACUUM INTO` does not carry the source's
+    // journal_mode to the new file), so a restore silently drops the
+    // operator's WAL setting back to the default. AGENTS.md's "smugglr
+    // never touches journal_mode" line is about smugglr's OWN databases,
+    // not a promise to preserve an arbitrary operator database's setting
+    // across a full-file replace -- and restoring to rollback-journal mode
+    // cannot itself hide committed rows the way the original bug did. This
+    // is called out in the PR body rather than silently shipped; preserving
+    // the operator's journal_mode across restore is not in #433's
+    // acceptance criteria and is left for a follow-up if wanted.
+    #[tokio::test]
+    async fn test_snapshot_then_restore_in_place_wal_mode() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let snap_dir = dir.path().join("snap_store");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        let conn = create_wal_test_db(&local_path, 25);
+
+        let config = make_file_stash_config(&snap_dir);
+        let snap_result = snapshot(&config, local_path.to_str().unwrap(), false)
+            .await
+            .unwrap();
+
+        // Release the writer (and its WAL/SHM handles) before simulating a
+        // bad migration and restoring over the same path.
+        drop(conn);
+
+        let bad_conn = Connection::open(&local_path).unwrap();
+        bad_conn.execute_batch("DELETE FROM items;").unwrap();
+        drop(bad_conn);
+
+        // Restore IN PLACE -- the real recovery flow.
+        let restore_result = restore(
+            &config,
+            local_path.to_str().unwrap(),
+            &snap_result.timestamp,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restore_result.timestamp, snap_result.timestamp);
+
+        let restored_conn =
+            Connection::open_with_flags(&local_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let restored_count: i64 = restored_conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap_or(0);
+        assert_eq!(
+            restored_count, 25,
+            "in-place restore must return every WAL-resident row"
+        );
+
+        // Documented side effect (see comment above): the restored file is
+        // rollback-journal, not WAL, regardless of the operator's prior
+        // setting.
+        let restored_mode: String = restored_conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            restored_mode.to_lowercase(),
+            "delete",
+            "VACUUM INTO output is rollback-journal; restore does not carry WAL forward"
+        );
+    }
+
+    // Regression for #433: the temp file must be removed on the `VACUUM
+    // INTO` error path, not just on success. Makes the source database's
+    // directory unwritable so `VACUUM INTO` cannot create its destination
+    // file there, then asserts the failure is surfaced as `SyncError::Stash`
+    // and no `.smugglr-snapshot-*.tmp` file is left behind. Gated off
+    // Windows (chmod-based write restriction is not portable there) and
+    // self-skips if this sandbox does not actually enforce the permission
+    // (e.g. running as root), rather than asserting a false negative.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn test_snapshot_vacuum_failure_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let snap_dir = dir.path().join("snap_store");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        create_test_db(&local_path, &[(1, "alpha", "2024-01-01")]);
+
+        // `snap_dir` already exists (created above) and keeps its own
+        // permissions when the parent is locked down, so the relay upload
+        // path stays writable -- only `dir.path()` itself (where
+        // `snapshot_temp_path` places the `VACUUM INTO` destination,
+        // alongside `local_path`) becomes read-only.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let probe_path = dir.path().join(".write-probe");
+        let probe_result = std::fs::write(&probe_path, b"probe");
+        let permissions_enforced = probe_result.is_err();
+        if probe_result.is_ok() {
+            let _ = std::fs::remove_file(&probe_path);
+        }
+
+        let config = make_file_stash_config(&snap_dir);
+        let result = snapshot(&config, local_path.to_str().unwrap(), false).await;
+
+        // Always restore write permission so `TempDir` can clean up on drop.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if !permissions_enforced {
+            // This sandbox does not enforce directory write permissions
+            // (e.g. running as root) -- cannot exercise the failure here.
+            return;
+        }
+
+        assert!(
+            result.is_err(),
+            "VACUUM INTO into an unwritable directory must fail"
+        );
+        assert!(matches!(result.unwrap_err(), SyncError::Stash(_)));
+        assert!(
+            leftover_snapshot_temp_files(dir.path()).is_empty(),
+            "no snapshot temp file should remain after a VACUUM INTO failure"
+        );
+    }
+
     #[tokio::test]
     async fn test_snapshot_dry_run() {
         let dir = TempDir::new().unwrap();
@@ -548,6 +867,13 @@ mod tests {
         // No files should have been created
         let snapshots_dir = snap_dir.join("snapshots");
         assert!(!snapshots_dir.exists());
+
+        // Dry run still runs `VACUUM INTO` to gather `size_bytes` -- its temp
+        // file must not survive either (#433).
+        assert!(
+            leftover_snapshot_temp_files(dir.path()).is_empty(),
+            "snapshot temp file leaked on the dry-run path"
+        );
     }
 
     #[tokio::test]
