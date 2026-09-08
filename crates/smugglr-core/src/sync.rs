@@ -950,6 +950,130 @@ mod tests {
         }
     }
 
+    // Review finding (#448, round 2): the dedup fix above got its own
+    // regression test, but the sibling fix in the same commit -- an
+    // unreadable `foreign_key_parents` now propagates via `?` instead of
+    // being warn!-logged and silently treated as "this table has no
+    // parents" -- had none. Nothing failed if a future edit quietly
+    // softened that back to `.ok()`/`unwrap_or_default()`, which would
+    // reintroduce exactly the unordered, FK-unsafe write order this whole
+    // change exists to replace, with no test signal. This pins it.
+    #[cfg(feature = "native")]
+    mod fk_error_propagation {
+        use super::super::get_tables_to_sync;
+        use crate::config::Config;
+        use crate::datasource::{DataSource, RowMeta, TableInfo};
+        use crate::error::{Result, SyncError};
+        use serde_json::Value;
+        use std::collections::HashMap;
+
+        /// A local side with one syncable table whose `foreign_key_parents`
+        /// always fails, simulating a `PRAGMA foreign_key_list` read that
+        /// errors on a table `list_tables`/`table_info` both already
+        /// confirmed exists.
+        struct FkErrorLocal;
+
+        impl DataSource for FkErrorLocal {
+            async fn list_tables(&self) -> Result<Vec<String>> {
+                Ok(vec!["orders".to_string()])
+            }
+            async fn table_info(&self, _table: &str) -> Result<TableInfo> {
+                Ok(TableInfo {
+                    name: "orders".to_string(),
+                    columns: vec![],
+                    primary_key: vec!["id".to_string()],
+                })
+            }
+            async fn get_row_metadata(
+                &self,
+                _table: &str,
+                _timestamp_column: &str,
+                _exclude_columns: &[String],
+            ) -> Result<HashMap<String, RowMeta>> {
+                Ok(HashMap::new())
+            }
+            async fn get_rows(
+                &self,
+                _table: &str,
+                _pk_values: &[String],
+            ) -> Result<Vec<HashMap<String, Value>>> {
+                Ok(vec![])
+            }
+            async fn upsert_rows(
+                &self,
+                _table: &str,
+                _rows: &[HashMap<String, Value>],
+            ) -> Result<usize> {
+                Ok(0)
+            }
+            async fn row_count(&self, _table: &str) -> Result<usize> {
+                Ok(0)
+            }
+            async fn foreign_key_parents(&self, _table: &str) -> Result<Vec<String>> {
+                Err(SyncError::TableNotFound(
+                    "simulated PRAGMA foreign_key_list failure".to_string(),
+                ))
+            }
+        }
+
+        /// The other side: only `list_tables` is ever called on it by
+        /// `get_tables_to_sync` (foreign-key introspection only reads
+        /// `local`), so everything else is unreachable and left unused.
+        struct StubRemote;
+
+        impl DataSource for StubRemote {
+            async fn list_tables(&self) -> Result<Vec<String>> {
+                Ok(vec!["orders".to_string()])
+            }
+            async fn table_info(&self, _table: &str) -> Result<TableInfo> {
+                Err(SyncError::TableNotFound("unused".to_string()))
+            }
+            async fn get_row_metadata(
+                &self,
+                _table: &str,
+                _timestamp_column: &str,
+                _exclude_columns: &[String],
+            ) -> Result<HashMap<String, RowMeta>> {
+                Ok(HashMap::new())
+            }
+            async fn get_rows(
+                &self,
+                _table: &str,
+                _pk_values: &[String],
+            ) -> Result<Vec<HashMap<String, Value>>> {
+                Ok(vec![])
+            }
+            async fn upsert_rows(
+                &self,
+                _table: &str,
+                _rows: &[HashMap<String, Value>],
+            ) -> Result<usize> {
+                Ok(0)
+            }
+            async fn row_count(&self, _table: &str) -> Result<usize> {
+                Ok(0)
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unreadable_foreign_key_list_fails_the_call_rather_than_falling_back_silently() {
+            let local = FkErrorLocal;
+            let remote = StubRemote;
+            let config = Config::from_toml_str("").unwrap();
+
+            let err = get_tables_to_sync(&local, &remote, &config)
+                .await
+                .expect_err(
+                    "a table whose foreign-key list cannot be read must fail the call, \
+                     not silently fall back to treating it as having no parents",
+                );
+            assert!(
+                matches!(err, SyncError::TableNotFound(_)),
+                "the underlying foreign_key_parents error propagates unchanged: {err}"
+            );
+        }
+    }
+
     #[test]
     fn a_configured_table_on_neither_side_is_named() {
         let err = check_table_set(
